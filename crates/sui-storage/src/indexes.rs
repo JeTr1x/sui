@@ -1,96 +1,98 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! IndexStore supports creation of various ancillary indexes of state in SuiDataStore.
 //! The main user of this data is the explorer.
 
-use rocksdb::Options;
+use move_core_types::identifier::Identifier;
 use serde::{de::DeserializeOwned, Serialize};
+use typed_store::rocks::DBMap;
+use typed_store::rocks::DBOptions;
+use typed_store::traits::Map;
+use typed_store::traits::TypedStoreDebug;
+use typed_store_derive::DBMapUtils;
 
-use crate::default_db_options;
-use std::path::Path;
+use sui_types::base_types::ObjectRef;
 use sui_types::base_types::{ObjectID, SuiAddress, TransactionDigest};
 use sui_types::batch::TxSequenceNumber;
 use sui_types::error::SuiResult;
-
-use sui_types::base_types::ObjectRef;
 use sui_types::object::Owner;
 
-use typed_store::rocks::DBMap;
-use typed_store::{reopen, traits::Map};
+use crate::default_db_options;
 
+#[derive(DBMapUtils)]
 pub struct IndexStore {
     /// Index from sui address to transactions initiated by that address.
+    #[default_options_override_fn = "transactions_from_addr_table_default_config"]
     transactions_from_addr: DBMap<(SuiAddress, TxSequenceNumber), TransactionDigest>,
 
     /// Index from sui address to transactions that were sent to that address.
+    #[default_options_override_fn = "transactions_to_addr_table_default_config"]
     transactions_to_addr: DBMap<(SuiAddress, TxSequenceNumber), TransactionDigest>,
 
     /// Index from object id to transactions that used that object id as input.
+    #[default_options_override_fn = "transactions_by_input_object_id_table_default_config"]
     transactions_by_input_object_id: DBMap<(ObjectID, TxSequenceNumber), TransactionDigest>,
 
     /// Index from object id to transactions that modified/created that object id.
+    #[default_options_override_fn = "transactions_by_mutated_object_id_table_default_config"]
     transactions_by_mutated_object_id: DBMap<(ObjectID, TxSequenceNumber), TransactionDigest>,
+
+    /// Index from package id, module and function identifier to transactions that used that moce function call as input.
+    #[default_options_override_fn = "transactions_by_move_function_table_default_config"]
+    transactions_by_move_function:
+        DBMap<(ObjectID, String, String, TxSequenceNumber), TransactionDigest>,
 
     /// This is a map between the transaction digest and its timestamp (UTC timestamp in
     /// **milliseconds** since epoch 1/1/1970). A transaction digest is subjectively time stamped
     /// on a node according to the local machine time, so it varies across nodes.
     /// The timestamping happens when the node sees a txn certificate for the first time.
+    #[default_options_override_fn = "timestamps_table_default_config"]
     timestamps: DBMap<TransactionDigest, u64>,
+
+    /// Index from transaction digest to sequence number.
+    #[default_options_override_fn = "transactions_seq_table_default_config"]
+    transactions_seq: DBMap<TransactionDigest, TxSequenceNumber>,
+}
+
+// These functions are used to initialize the DB tables
+fn transactions_seq_table_default_config() -> DBOptions {
+    default_db_options(None, Some(1_000_000)).0
+}
+fn transactions_from_addr_table_default_config() -> DBOptions {
+    default_db_options(None, Some(1_000_000)).0
+}
+fn transactions_to_addr_table_default_config() -> DBOptions {
+    default_db_options(None, Some(1_000_000)).0
+}
+fn transactions_by_input_object_id_table_default_config() -> DBOptions {
+    default_db_options(None, Some(1_000_000)).0
+}
+fn transactions_by_mutated_object_id_table_default_config() -> DBOptions {
+    default_db_options(None, Some(1_000_000)).0
+}
+fn transactions_by_move_function_table_default_config() -> DBOptions {
+    default_db_options(None, Some(1_000_000)).0
+}
+fn timestamps_table_default_config() -> DBOptions {
+    default_db_options(None, Some(1_000_000)).1
 }
 
 impl IndexStore {
-    pub fn open<P: AsRef<Path>>(path: P, db_options: Option<Options>) -> Self {
-        let (options, point_lookup) = default_db_options(db_options, Some(1_000_000));
-
-        let db = {
-            let path = &path;
-            let db_options = Some(options.clone());
-            let opt_cfs: &[(&str, &rocksdb::Options)] = &[
-                ("transactions_from_addr", &options),
-                ("transactions_to_addr", &options),
-                ("transactions_by_input_object_id", &options),
-                ("transactions_by_mutated_object_id", &options),
-                ("timestamps", &point_lookup),
-            ];
-            typed_store::rocks::open_cf_opts(path, db_options, opt_cfs)
-        }
-        .expect("Cannot open DB.");
-
-        let (
-            transactions_from_addr,
-            transactions_to_addr,
-            transactions_by_input_object_id,
-            transactions_by_mutated_object_id,
-            timestamps,
-        ) = reopen!(
-            &db,
-            "transactions_from_addr"; <(SuiAddress, TxSequenceNumber), TransactionDigest>,
-            "transactions_to_addr"; <(SuiAddress, TxSequenceNumber), TransactionDigest>,
-            "transactions_by_input_object_id"; <(ObjectID, TxSequenceNumber), TransactionDigest>,
-            "transactions_by_mutated_object_id"; <(ObjectID, TxSequenceNumber), TransactionDigest>,
-            "timestamps";<TransactionDigest, u64>
-        );
-
-        Self {
-            transactions_from_addr,
-            transactions_to_addr,
-            transactions_by_input_object_id,
-            transactions_by_mutated_object_id,
-            timestamps,
-        }
-    }
-
-    pub fn index_tx<'a>(
+    pub fn index_tx(
         &self,
         sender: SuiAddress,
         active_inputs: impl Iterator<Item = ObjectID>,
-        mutated_objects: impl Iterator<Item = &'a (ObjectRef, Owner)> + Clone,
+        mutated_objects: impl Iterator<Item = (ObjectRef, Owner)> + Clone,
+        move_functions: impl Iterator<Item = (ObjectID, Identifier, Identifier)> + Clone,
         sequence: TxSequenceNumber,
         digest: &TransactionDigest,
         timestamp_ms: u64,
     ) -> SuiResult {
         let batch = self.transactions_from_addr.batch();
+
+        let batch =
+            batch.insert_batch(&self.transactions_seq, std::iter::once((*digest, sequence)))?;
 
         let batch = batch.insert_batch(
             &self.transactions_from_addr,
@@ -107,6 +109,16 @@ impl IndexStore {
             mutated_objects
                 .clone()
                 .map(|(obj_ref, _)| ((obj_ref.0, sequence), *digest)),
+        )?;
+
+        let batch = batch.insert_batch(
+            &self.transactions_by_move_function,
+            move_functions.map(|(obj_id, module, function)| {
+                (
+                    (obj_id, module.to_string(), function.to_string(), sequence),
+                    *digest,
+                )
+            }),
         )?;
 
         let batch = batch.insert_batch(
@@ -136,45 +148,149 @@ impl IndexStore {
         Ok(ts)
     }
 
-    fn get_transactions_by_object<
-        KeyT: Clone + Serialize + DeserializeOwned + std::cmp::PartialEq,
-    >(
+    fn get_transactions_from_index<KeyT: Clone + Serialize + DeserializeOwned + PartialEq>(
         index: &DBMap<(KeyT, TxSequenceNumber), TransactionDigest>,
-        object_id: KeyT,
-    ) -> SuiResult<Vec<(TxSequenceNumber, TransactionDigest)>> {
-        Ok(index
-            .iter()
-            .skip_to(&(object_id.clone(), TxSequenceNumber::MIN))?
-            .take_while(|((id, _), _)| *id == object_id)
-            .map(|((_, seq), digest)| (seq, digest))
-            .collect())
+        key: KeyT,
+        cursor: TxSequenceNumber,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> SuiResult<Vec<TransactionDigest>> {
+        Ok(if reverse {
+            let iter = index
+                .iter()
+                .skip_prior_to(&(key.clone(), cursor))?
+                .reverse()
+                .take_while(|((id, _), _)| *id == key)
+                .map(|(_, digest)| digest);
+            if let Some(limit) = limit {
+                iter.take(limit).collect()
+            } else {
+                iter.collect()
+            }
+        } else {
+            let iter = index
+                .iter()
+                .skip_to(&(key.clone(), cursor))?
+                .take_while(|((id, _), _)| *id == key)
+                .map(|(_, digest)| digest);
+            if let Some(limit) = limit {
+                iter.take(limit).collect()
+            } else {
+                iter.collect()
+            }
+        })
     }
 
     pub fn get_transactions_by_input_object(
         &self,
         input_object: ObjectID,
-    ) -> SuiResult<Vec<(TxSequenceNumber, TransactionDigest)>> {
-        Self::get_transactions_by_object(&self.transactions_by_input_object_id, input_object)
+        cursor: TxSequenceNumber,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> SuiResult<Vec<TransactionDigest>> {
+        Self::get_transactions_from_index(
+            &self.transactions_by_input_object_id,
+            input_object,
+            cursor,
+            limit,
+            reverse,
+        )
     }
 
     pub fn get_transactions_by_mutated_object(
         &self,
         mutated_object: ObjectID,
-    ) -> SuiResult<Vec<(TxSequenceNumber, TransactionDigest)>> {
-        Self::get_transactions_by_object(&self.transactions_by_mutated_object_id, mutated_object)
+        cursor: TxSequenceNumber,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> SuiResult<Vec<TransactionDigest>> {
+        Self::get_transactions_from_index(
+            &self.transactions_by_mutated_object_id,
+            mutated_object,
+            cursor,
+            limit,
+            reverse,
+        )
     }
 
     pub fn get_transactions_from_addr(
         &self,
         addr: SuiAddress,
-    ) -> SuiResult<Vec<(TxSequenceNumber, TransactionDigest)>> {
-        Self::get_transactions_by_object(&self.transactions_from_addr, addr)
+        cursor: TxSequenceNumber,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> SuiResult<Vec<TransactionDigest>> {
+        Self::get_transactions_from_index(
+            &self.transactions_from_addr,
+            addr,
+            cursor,
+            limit,
+            reverse,
+        )
+    }
+
+    pub fn get_transactions_by_move_function(
+        &self,
+        package: ObjectID,
+        module: Option<String>,
+        function: Option<String>,
+        cursor: TxSequenceNumber,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> SuiResult<Vec<TransactionDigest>> {
+        let key = (
+            package,
+            module.clone().unwrap_or_default(),
+            function.clone().unwrap_or_default(),
+            cursor,
+        );
+        let iter = self.transactions_by_move_function.iter();
+        Ok(if reverse {
+            let iter = iter
+                .skip_prior_to(&key)?
+                .reverse()
+                .take_while(|((id, m, f, _), _)| {
+                    *id == package
+                        && module.as_ref().map(|x| x == m).unwrap_or(true)
+                        && function.as_ref().map(|x| x == f).unwrap_or(true)
+                })
+                .map(|(_, digest)| digest);
+            if let Some(limit) = limit {
+                iter.take(limit).collect()
+            } else {
+                iter.collect()
+            }
+        } else {
+            let iter = iter
+                .skip_to(&key)?
+                .take_while(|((id, m, f, _), _)| {
+                    *id == package
+                        && module.as_ref().map(|x| x == m).unwrap_or(true)
+                        && function.as_ref().map(|x| x == f).unwrap_or(true)
+                })
+                .map(|(_, digest)| digest);
+            if let Some(limit) = limit {
+                iter.take(limit).collect()
+            } else {
+                iter.collect()
+            }
+        })
     }
 
     pub fn get_transactions_to_addr(
         &self,
         addr: SuiAddress,
-    ) -> SuiResult<Vec<(TxSequenceNumber, TransactionDigest)>> {
-        Self::get_transactions_by_object(&self.transactions_to_addr, addr)
+        cursor: TxSequenceNumber,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> SuiResult<Vec<TransactionDigest>> {
+        Self::get_transactions_from_index(&self.transactions_to_addr, addr, cursor, limit, reverse)
+    }
+
+    pub fn get_transaction_seq(
+        &self,
+        digest: &TransactionDigest,
+    ) -> SuiResult<Option<TxSequenceNumber>> {
+        Ok(self.transactions_seq.get(digest)?)
     }
 }

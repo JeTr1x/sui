@@ -12,6 +12,7 @@
 # Move build directory
 build
 storage/
+!narwhal/storage
 
 # Thumbnails
 ._*
@@ -23,5 +24,12 @@ storage/
 # Python
 .pyc
 
+# Node.js
+node_modules
+.tsbuildinfo
+tsconfig.tsbuildinfo
+
 # logs
 wallet.log.*
+sui.log.*
+.vercel

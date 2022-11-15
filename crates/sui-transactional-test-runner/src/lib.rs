@@ -1,10 +1,9 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module contains the transactional test runner instantiation for the Sui adapter
 
 pub mod args;
-pub mod in_memory_storage;
 pub mod test_adapter;
 
 use move_transactional_test_runner::framework::run_test_impl;

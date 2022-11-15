@@ -1,4 +1,4 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{bail, ensure};
@@ -8,7 +8,8 @@ use move_command_line_common::{parser::Parser as MoveCLParser, values::ValueToke
 use move_compiler::shared::parse_u128;
 use move_core_types::identifier::Identifier;
 use move_core_types::value::{MoveStruct, MoveValue};
-use sui_types::messages::CallArg;
+use sui_types::messages::{CallArg, ObjectArg};
+use sui_types::object::Owner;
 
 use crate::test_adapter::SuiTestAdapter;
 
@@ -40,9 +41,22 @@ pub struct ViewObjectCommand {
 }
 
 #[derive(Debug, clap::Parser)]
+pub struct TransferObjectCommand {
+    pub id: u64,
+    #[clap(long = "recipient")]
+    pub recipient: String,
+    #[clap(long = "sender")]
+    pub sender: Option<String>,
+    #[clap(long = "gas-budget")]
+    pub gas_budget: Option<u64>,
+}
+
+#[derive(Debug, clap::Parser)]
 pub enum SuiSubcommand {
     #[clap(name = "view-object")]
     ViewObject(ViewObjectCommand),
+    #[clap(name = "transfer-object")]
+    TransferObject(TransferObjectCommand),
 }
 
 #[derive(Debug)]
@@ -53,11 +67,12 @@ pub enum SuiExtraValueArgs {
 pub enum SuiValue {
     MoveValue(MoveValue),
     Object(u64),
+    ObjVec(Vec<u64>),
 }
 
 impl SuiExtraValueArgs {
     fn parse_value_impl<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
-        parser: &mut MoveCLParser<'a, move_command_line_common::values::ValueToken, I>,
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
     ) -> anyhow::Result<Self> {
         let contents = parser.advance(ValueToken::Ident)?;
         ensure!(contents == "object");
@@ -76,28 +91,51 @@ impl SuiValue {
     fn assert_move_value(self) -> MoveValue {
         match self {
             SuiValue::MoveValue(v) => v,
-            SuiValue::Object(_) => panic!("nested sui objects are not yet supported in args"),
+            SuiValue::Object(_) => panic!("unexpected nested Sui object in args"),
+            SuiValue::ObjVec(_) => panic!("unexpected nested Sui object vector in args"),
+        }
+    }
+
+    fn assert_object(self) -> u64 {
+        match self {
+            SuiValue::MoveValue(_) => panic!("unexpected nested non-object value in args"),
+            SuiValue::Object(v) => v,
+            SuiValue::ObjVec(_) => panic!("unexpected nested Sui object vector in args"),
+        }
+    }
+
+    fn object_arg(fake_id: u64, test_adapter: &SuiTestAdapter) -> anyhow::Result<ObjectArg> {
+        let id = match test_adapter.fake_to_real_object_id(fake_id) {
+            Some(id) => id,
+            None => bail!("INVALID TEST. Unknown object, object({})", fake_id),
+        };
+        let obj = match test_adapter.storage.get_object(&id) {
+            Some(obj) => obj,
+            None => bail!("INVALID TEST. Could not load object argument {}", id),
+        };
+        match obj.owner {
+            Owner::Shared {
+                initial_shared_version,
+            } => Ok(ObjectArg::SharedObject {
+                id,
+                initial_shared_version,
+            }),
+            Owner::AddressOwner(_) | Owner::ObjectOwner(_) | Owner::Immutable => {
+                let obj_ref = obj.compute_object_reference();
+                Ok(ObjectArg::ImmOrOwnedObject(obj_ref))
+            }
         }
     }
 
     pub(crate) fn into_call_args(self, test_adapter: &SuiTestAdapter) -> anyhow::Result<CallArg> {
         Ok(match self {
-            SuiValue::Object(fake_id) => {
-                let id = match test_adapter.fake_to_real_object_id(fake_id) {
-                    Some(id) => id,
-                    None => bail!("INVALID TEST. Unknown object, object({})", fake_id),
-                };
-                let obj = match test_adapter.storage.get_object(&id) {
-                    Some(obj) => obj,
-                    None => bail!("INVALID TEST. Could not load object argument {}", id),
-                };
-                if obj.is_shared() {
-                    CallArg::SharedObject(id)
-                } else {
-                    let obj_ref = obj.compute_object_reference();
-                    CallArg::ImmOrOwnedObject(obj_ref)
-                }
-            }
+            SuiValue::Object(fake_id) => CallArg::Object(Self::object_arg(fake_id, test_adapter)?),
+            SuiValue::ObjVec(vec) => CallArg::ObjVec(
+                vec.iter()
+                    .map(|fake_id| Self::object_arg(*fake_id, test_adapter))
+                    .collect::<Result<Vec<ObjectArg>, _>>()?,
+            ),
+
             SuiValue::MoveValue(v) => CallArg::Pure(v.simple_serialize().unwrap()),
         })
     }
@@ -107,7 +145,7 @@ impl ParsableValue for SuiExtraValueArgs {
     type ConcreteValue = SuiValue;
 
     fn parse_value<'a, I: Iterator<Item = (ValueToken, &'a str)>>(
-        parser: &mut MoveCLParser<'a, move_command_line_common::values::ValueToken, I>,
+        parser: &mut MoveCLParser<'a, ValueToken, I>,
     ) -> Option<anyhow::Result<Self>> {
         match parser.peek()? {
             (ValueToken::Ident, "object") => Some(Self::parse_value_impl(parser)),
@@ -120,9 +158,15 @@ impl ParsableValue for SuiExtraValueArgs {
     }
 
     fn concrete_vector(elems: Vec<Self::ConcreteValue>) -> anyhow::Result<Self::ConcreteValue> {
-        Ok(SuiValue::MoveValue(MoveValue::Vector(
-            elems.into_iter().map(SuiValue::assert_move_value).collect(),
-        )))
+        if !elems.is_empty() && matches!(elems[0], SuiValue::Object(_)) {
+            Ok(SuiValue::ObjVec(
+                elems.into_iter().map(SuiValue::assert_object).collect(),
+            ))
+        } else {
+            Ok(SuiValue::MoveValue(MoveValue::Vector(
+                elems.into_iter().map(SuiValue::assert_move_value).collect(),
+            )))
+        }
     }
 
     fn concrete_struct(

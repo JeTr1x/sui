@@ -1,11 +1,15 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 import nacl from 'tweetnacl';
 import { Base64DataBuffer } from '../serialization/base64';
 import { Keypair } from './keypair';
-import { PublicKey } from './publickey';
-import { TextEncoder } from 'util';
+import { Ed25519PublicKey } from './ed25519-publickey';
+import { SignatureScheme } from './publickey';
+import { isValidHardenedPath, mnemonicToSeedHex } from './mnemonics';
+import { derivePath, getPublicKey } from '../utils/ed25519-hd-key';
+
+export const DEFAULT_ED25519_DERIVATION_PATH = "m/44'/784'/0'/0'/0'";
 
 /**
  * Ed25519 Keypair data
@@ -22,10 +26,10 @@ export class Ed25519Keypair implements Keypair {
   private keypair: Ed25519KeypairData;
 
   /**
-   * Create a new keypair instance.
+   * Create a new Ed25519 keypair instance.
    * Generate random keypair if no {@link Ed25519Keypair} is provided.
    *
-   * @param keypair ed25519 keypair
+   * @param keypair Ed25519 keypair
    */
   constructor(keypair?: Ed25519KeypairData) {
     if (keypair) {
@@ -36,28 +40,41 @@ export class Ed25519Keypair implements Keypair {
   }
 
   /**
-   * Generate a new random keypair
+   * Get the key scheme of the keypair ED25519
+   */
+  getKeyScheme(): SignatureScheme {
+    return 'ED25519';
+  }
+
+  /**
+   * Generate a new random Ed25519 keypair
    */
   static generate(): Ed25519Keypair {
     return new Ed25519Keypair(nacl.sign.keyPair());
   }
 
   /**
-   * Create a keypair from a raw secret key byte array.
+   * Create a Ed25519 keypair from a raw secret key byte array.
    *
    * This method should only be used to recreate a keypair from a previously
-   * generated secret key. Generating keypairs from a random seed should be done
-   * with the {@link Keypair.fromSeed} method.
+   * generated secret key.
    *
    * @throws error if the provided secret key is invalid and validation is not skipped.
    *
    * @param secretKey secret key byte array
    * @param options: skip secret key validation
    */
-  static fromSecretKey(
-    secretKey: Uint8Array,
-    options?: { skipValidation?: boolean }
-  ): Ed25519Keypair {
+  static fromSecretKey(secretKey: Uint8Array, options?: { skipValidation?: boolean }): Ed25519Keypair {
+    const secretKeyLength = secretKey.length;
+    if (secretKeyLength != 64) {
+      // Many users actually wanted to invoke fromSeed(seed: Uint8Array), especially when reading from keystore.
+      if (secretKeyLength == 32) {
+        throw new Error(
+            'Wrong secretKey size. Expected 64 bytes, got 32. Similar function exists: fromSeed(seed: Uint8Array)'
+        );
+      }
+      throw new Error(`Wrong secretKey size. Expected 64 bytes, got ${secretKeyLength}.`);
+    }
     const keypair = nacl.sign.keyPair.fromSecretKey(secretKey);
     if (!options || !options.skipValidation) {
       const encoder = new TextEncoder();
@@ -71,27 +88,56 @@ export class Ed25519Keypair implements Keypair {
   }
 
   /**
-   * Generate a keypair from a 32 byte seed.
+   * Generate an Ed25519 keypair from a 32 byte seed.
    *
    * @param seed seed byte array
    */
   static fromSeed(seed: Uint8Array): Ed25519Keypair {
+    const seedLength = seed.length;
+    if (seedLength != 32) {
+      throw new Error(`Wrong seed size. Expected 32 bytes, got ${seedLength}.`);
+    }
     return new Ed25519Keypair(nacl.sign.keyPair.fromSeed(seed));
   }
 
   /**
-   * The public key for this keypair
+   * The public key for this Ed25519 keypair
    */
-  getPublicKey(): PublicKey {
-    return new PublicKey(this.keypair.publicKey);
+  getPublicKey(): Ed25519PublicKey {
+    return new Ed25519PublicKey(this.keypair.publicKey);
   }
 
   /**
-   * Return the signature for the provided data.
+   * Return the signature for the provided data using Ed25519.
    */
   signData(data: Base64DataBuffer): Base64DataBuffer {
     return new Base64DataBuffer(
       nacl.sign.detached(data.getData(), this.keypair.secretKey)
     );
+  }
+
+  /**
+   * Derive Ed25519 keypair from mnemonics and path. The mnemonics must be normalized
+   * and validated against the english wordlist.
+   *
+   * If path is none, it will default to m/44'/784'/0'/0'/0', otherwise the path must
+   * be compliant to SLIP-0010 in form m/44'/784'/{account_index}'/{change_index}'/{address_index}'.
+   */
+  static deriveKeypair(mnemonics: string, path?: string): Ed25519Keypair {
+    if (path == null) {
+      path = DEFAULT_ED25519_DERIVATION_PATH;
+    }
+    if (!isValidHardenedPath(path)) {
+      throw new Error('Invalid derivation path');
+    }
+    const { key } = derivePath(path, mnemonicToSeedHex(mnemonics));
+    const pubkey = getPublicKey(key, false);
+
+    // Ed25519 private key returned here has 32 bytes. NaCl expects 64 bytes where the last 32 bytes are the public key.
+    let fullPrivateKey = new Uint8Array(64);
+    fullPrivateKey.set(key);
+    fullPrivateKey.set(pubkey, 32);
+
+    return new Ed25519Keypair({ publicKey: pubkey, secretKey: fullPrivateKey });
   }
 }

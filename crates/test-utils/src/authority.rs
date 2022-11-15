@@ -1,41 +1,43 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-use crate::{messages::make_certificates, TEST_COMMITTEE_SIZE};
+use crate::TEST_COMMITTEE_SIZE;
+use prometheus::Registry;
 use rand::{prelude::StdRng, SeedableRng};
-use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
-use sui_config::{NetworkConfig, ValidatorInfo};
+use sui_config::{NetworkConfig, NodeConfig, ValidatorInfo};
+use sui_core::authority_client::{AuthorityAPI, NetworkAuthorityClientMetrics};
 use sui_core::{
-    authority_aggregator::AuthorityAggregator, authority_client::AuthorityAPI,
+    authority_active::{
+        checkpoint_driver::{CheckpointMetrics, CheckpointProcessControl},
+        ActiveAuthority,
+    },
+    authority_aggregator::AuthorityAggregatorBuilder,
     authority_client::NetworkAuthorityClient,
 };
-use sui_node::SuiNode;
-use sui_types::{
-    committee::Committee,
-    error::SuiResult,
-    messages::{
-        ConfirmationTransaction, ConsensusTransaction, Transaction, TransactionInfoResponse,
-    },
-    object::Object,
-};
+use sui_types::object::Object;
+
+pub use sui_node::{SuiNode, SuiNodeHandle};
+use sui_types::base_types::ObjectID;
+use sui_types::messages::{ObjectInfoRequest, ObjectInfoRequestKind};
 
 /// The default network buffer size of a test authority.
 pub const NETWORK_BUFFER_SIZE: usize = 65_000;
 
 /// Make an authority config for each of the `TEST_COMMITTEE_SIZE` authorities in the test committee.
 pub fn test_authority_configs() -> NetworkConfig {
+    test_and_configure_authority_configs(TEST_COMMITTEE_SIZE)
+}
+
+pub fn test_and_configure_authority_configs(committee_size: usize) -> NetworkConfig {
     let config_dir = tempfile::tempdir().unwrap().into_path();
     let rng = StdRng::from_seed([0; 32]);
-    let mut configs = NetworkConfig::generate_with_rng(&config_dir, TEST_COMMITTEE_SIZE, rng);
+    let mut configs = NetworkConfig::generate_with_rng(&config_dir, committee_size, rng);
     for config in configs.validator_configs.iter_mut() {
-        // Disable gossip by default to reduce non-determinism.
-        // TODO: Once this library is more broadly used, we can make this a config argument.
-        config.enable_gossip = false;
-
         let parameters = &mut config.consensus_config.as_mut().unwrap().narwhal_config;
         // NOTE: the following parameters are important to ensure tests run fast. Using the default
         // Narwhal parameters may result in tests taking >60 seconds.
-        parameters.header_size = 1;
+        parameters.header_num_of_batches_threshold = 1;
         parameters.max_header_delay = Duration::from_millis(200);
         parameters.batch_size = 1;
         parameters.max_batch_delay = Duration::from_millis(200);
@@ -43,107 +45,120 @@ pub fn test_authority_configs() -> NetworkConfig {
     configs
 }
 
+#[cfg(not(msim))]
+pub async fn start_node(config: &NodeConfig, prom_registry: Registry) -> SuiNodeHandle {
+    SuiNode::start(config, prom_registry).await.unwrap().into()
+}
+
+/// In the simulator, we call SuiNode::start from inside a newly spawned simulator node.
+/// However, we then immediately return the SuiNode handle back to the caller. The caller now has
+/// a direct handle to an object that is "running" on a different "machine". By itself, this
+/// doesn't break anything in the simulator, it just allows test code to magically mutate state
+/// that is owned by some other machine.
+///
+/// Most of the time, tests do this just in order to verify some internal state, so this is fine
+/// most of the time.
+#[cfg(msim)]
+pub async fn start_node(config: &NodeConfig, prom_registry: Registry) -> SuiNodeHandle {
+    use std::net::{IpAddr, SocketAddr};
+
+    let config = config.clone();
+    let socket_addr = mysten_network::multiaddr::to_socket_addr(&config.network_address).unwrap();
+    let ip = match socket_addr {
+        SocketAddr::V4(v4) => IpAddr::V4(*v4.ip()),
+        _ => panic!("unsupported protocol"),
+    };
+
+    let handle = sui_simulator::runtime::Handle::current();
+    let builder = handle.create_node();
+    let node = builder
+        .ip(ip)
+        .name(format!("{:?}", config.protocol_public_key().concise()))
+        .init(|| async {
+            tracing::info!("node restarted");
+        })
+        .build();
+
+    node.spawn(async move { SuiNode::start(&config, prom_registry).await.unwrap() })
+        .await
+        .unwrap()
+        .into()
+}
+
 /// Spawn all authorities in the test committee into a separate tokio task.
-pub async fn spawn_test_authorities<I>(objects: I, config: &NetworkConfig) -> Vec<SuiNode>
+pub async fn spawn_test_authorities<I>(objects: I, config: &NetworkConfig) -> Vec<SuiNodeHandle>
 where
     I: IntoIterator<Item = Object> + Clone,
 {
     let mut handles = Vec::new();
     for validator in config.validator_configs() {
-        let node = SuiNode::start(validator).await.unwrap();
-        let state = node.state();
+        let prom_registry = Registry::new();
+        let node = start_node(validator, prom_registry).await;
+        let objects = objects.clone();
 
-        for o in objects.clone() {
-            state.insert_genesis_object(o).await
-        }
+        node.with_async(|node| async move {
+            let state = node.state();
+            for o in objects {
+                state.insert_genesis_object(o).await
+            }
+        })
+        .await;
 
         handles.push(node);
     }
     handles
 }
 
-/// Create a test authority aggregator.
-pub fn test_authority_aggregator(
-    config: &NetworkConfig,
-) -> AuthorityAggregator<NetworkAuthorityClient> {
-    let validators_info = config.validator_set();
-    let voting_rights: BTreeMap<_, _> = validators_info
-        .iter()
-        .map(|config| (config.public_key(), config.stake()))
-        .collect();
-    let committee = Committee::new(0, voting_rights);
-    let clients: BTreeMap<_, _> = validators_info
-        .iter()
-        .map(|config| {
-            (
-                config.public_key(),
-                NetworkAuthorityClient::connect_lazy(config.network_address()).unwrap(),
-            )
-        })
-        .collect();
-    AuthorityAggregator::new(committee, clients)
+/// Spawn checkpoint processes with very short checkpointing intervals.
+pub async fn spawn_checkpoint_processes(configs: &NetworkConfig, handles: &[SuiNodeHandle]) {
+    // Start active part of each authority.
+    for handle in handles {
+        handle
+            .with_async(|authority| async move {
+                let state = authority.state();
+
+                let (aggregator, _) = AuthorityAggregatorBuilder::from_network_config(configs)
+                    .with_committee_store(authority.state().committee_store().clone())
+                    .build()
+                    .unwrap();
+
+                let inner_agg = aggregator.clone();
+                let active_state = Arc::new(
+                    ActiveAuthority::new_with_ephemeral_storage_for_test(state, inner_agg).unwrap(),
+                );
+                let checkpoint_process_control = CheckpointProcessControl {
+                    long_pause_between_checkpoints: Duration::from_millis(10),
+                    ..CheckpointProcessControl::default()
+                };
+                let _active_authority_handle = active_state
+                    .spawn_checkpoint_process_with_config(
+                        checkpoint_process_control,
+                        CheckpointMetrics::new_for_tests(),
+                    )
+                    .await;
+            })
+            .await;
+    }
 }
 
 /// Get a network client to communicate with the consensus.
 pub fn get_client(config: &ValidatorInfo) -> NetworkAuthorityClient {
-    NetworkAuthorityClient::connect_lazy(config.network_address()).unwrap()
+    NetworkAuthorityClient::connect_lazy(
+        config.network_address(),
+        Arc::new(NetworkAuthorityClientMetrics::new_for_tests()),
+    )
+    .unwrap()
 }
 
-/// Submit a certificate containing only owned-objects to all authorities.
-pub async fn submit_single_owner_transaction(
-    transaction: Transaction,
-    configs: &[ValidatorInfo],
-) -> Vec<TransactionInfoResponse> {
-    let certificate = make_certificates(vec![transaction]).pop().unwrap();
-    let txn = ConfirmationTransaction { certificate };
-
-    let mut responses = Vec::new();
-    for config in configs {
-        let client = get_client(config);
-        let reply = client
-            .handle_confirmation_transaction(txn.clone())
-            .await
-            .unwrap();
-        responses.push(reply);
-    }
-    responses
-}
-
-/// Keep submitting the certificates of a shared-object transaction until it is sequenced by
-/// at least one consensus node. We use the loop since some consensus protocols (like Tusk)
-/// may drop transactions. The certificate is submitted to every Sui authority.
-pub async fn submit_shared_object_transaction(
-    transaction: Transaction,
-    configs: &[ValidatorInfo],
-) -> Vec<SuiResult<TransactionInfoResponse>> {
-    let certificate = make_certificates(vec![transaction]).pop().unwrap();
-    let message = ConsensusTransaction::UserTransaction(Box::new(certificate));
-
-    loop {
-        let futures: Vec<_> = configs
-            .iter()
-            .map(|config| {
-                let client = get_client(config);
-                let txn = message.clone();
-                async move { client.handle_consensus_transaction(txn).await }
-            })
-            .collect();
-
-        let replies: Vec<_> = futures::future::join_all(futures)
-            .await
-            .into_iter()
-            // Remove all `FailedToHearBackFromConsensus` replies. Note that the original Sui error type
-            // `SuiError::FailedToHearBackFromConsensus(..)` is lost when the message is sent through the
-            // network (it is replaced by `RpcError`). As a result, the following filter doesn't work:
-            // `.filter(|result| !matches!(result, Err(SuiError::FailedToHearBackFromConsensus(..))))`.
-            .filter(|result| match result {
-                Err(e) => !e.to_string().contains("deadline has elapsed"),
-                _ => true,
-            })
-            .collect();
-
-        if !replies.is_empty() {
-            break replies;
-        }
-    }
+pub async fn get_object(config: &ValidatorInfo, object_id: ObjectID) -> Object {
+    get_client(config)
+        .handle_object_info_request(ObjectInfoRequest {
+            object_id,
+            request_kind: ObjectInfoRequestKind::LatestObjectInfo(None),
+        })
+        .await
+        .unwrap()
+        .object()
+        .unwrap()
+        .clone()
 }

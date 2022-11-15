@@ -1,24 +1,26 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod verifier;
 
 pub mod entry_points_verifier;
 pub mod global_storage_access_verifier;
-pub mod id_immutable_verifier;
 pub mod id_leak_verifier;
-pub mod private_transfer;
+pub mod one_time_witness_verifier;
+pub mod private_generics;
 pub mod struct_with_key_verifier;
 
 use move_binary_format::{
     binary_views::BinaryIndexedView,
     file_format::{SignatureToken, StructHandleIndex},
 };
-use move_core_types::{account_address::AccountAddress, identifier::IdentStr};
-use sui_types::error::SuiError;
+use move_core_types::{account_address::AccountAddress, ident_str, identifier::IdentStr};
+use sui_types::error::{ExecutionError, ExecutionErrorKind};
 
-fn verification_failure(error: String) -> SuiError {
-    SuiError::ModuleVerificationFailure { error }
+pub const INIT_FN_NAME: &IdentStr = ident_str!("init");
+
+fn verification_failure(error: String) -> ExecutionError {
+    ExecutionError::new_with_source(ExecutionErrorKind::SuiMoveVerificationError, error)
 }
 
 // TODO move these to move bytecode utils
@@ -38,8 +40,11 @@ pub fn format_signature_token(view: &BinaryIndexedView, t: &SignatureToken) -> S
     match t {
         SignatureToken::Bool => "bool".to_string(),
         SignatureToken::U8 => "u8".to_string(),
+        SignatureToken::U16 => "u16".to_string(),
+        SignatureToken::U32 => "u32".to_string(),
         SignatureToken::U64 => "u64".to_string(),
         SignatureToken::U128 => "u128".to_string(),
+        SignatureToken::U256 => "u256".to_string(),
         SignatureToken::Address => "address".to_string(),
         SignatureToken::Signer => "signer".to_string(),
         SignatureToken::Vector(inner) => {

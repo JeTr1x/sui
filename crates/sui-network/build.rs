@@ -1,7 +1,10 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 use tonic_build::manual::{Builder, Method, Service};
 
 type Result<T> = ::std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -30,18 +33,9 @@ fn main() -> Result<()> {
         )
         .method(
             Method::builder()
-                .name("confirmation_transaction")
-                .route_name("ConfirmationTransaction")
+                .name("handle_certificate")
+                .route_name("CertifiedTransaction")
                 .input_type("sui_types::messages::CertifiedTransaction")
-                .output_type("sui_types::messages::TransactionInfoResponse")
-                .codec_path(codec_path)
-                .build(),
-        )
-        .method(
-            Method::builder()
-                .name("consensus_transaction")
-                .route_name("ConsensusTransaction")
-                .input_type("sui_types::messages::ConsensusTransaction")
                 .output_type("sui_types::messages::TransactionInfoResponse")
                 .codec_path(codec_path)
                 .build(),
@@ -85,10 +79,29 @@ fn main() -> Result<()> {
         .method(
             Method::builder()
                 .name("batch_info")
-                .route_name("BatchInfo")
+                .route_name("FollowTxStream")
                 .input_type("sui_types::messages::BatchInfoRequest")
                 .output_type("sui_types::messages::BatchInfoResponseItem")
                 .server_streaming()
+                .codec_path(codec_path)
+                .build(),
+        )
+        .method(
+            Method::builder()
+                .name("checkpoint_info")
+                .route_name("FollowCheckpointStream")
+                .input_type("sui_types::messages::CheckpointStreamRequest")
+                .output_type("sui_types::messages::CheckpointStreamResponseItem")
+                .server_streaming()
+                .codec_path(codec_path)
+                .build(),
+        )
+        .method(
+            Method::builder()
+                .name("committee_info")
+                .route_name("CommitteeInfo")
+                .input_type("sui_types::messages::CommitteeInfoRequest")
+                .output_type("sui_types::messages::CommitteeInfoResponse")
                 .codec_path(codec_path)
                 .build(),
         )
@@ -98,8 +111,39 @@ fn main() -> Result<()> {
         .out_dir(&out_dir)
         .compile(&[validator_service]);
 
+    build_anemo_services(&out_dir);
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=DUMP_GENERATED_GRPC");
 
     Ok(())
+}
+
+fn build_anemo_services(out_dir: &Path) {
+    let discovery = anemo_build::manual::Service::builder()
+        .name("Discovery")
+        .package("sui")
+        .method(
+            anemo_build::manual::Method::builder()
+                .name("get_external_address")
+                .route_name("GetExternalAddress")
+                .request_type("()")
+                .response_type("std::net::SocketAddr")
+                .codec_path("anemo::rpc::codec::BincodeCodec")
+                .build(),
+        )
+        .method(
+            anemo_build::manual::Method::builder()
+                .name("get_known_peers")
+                .route_name("GetKnownPeers")
+                .request_type("()")
+                .response_type("crate::discovery::GetKnownPeersResponse")
+                .codec_path("anemo::rpc::codec::BincodeCodec")
+                .build(),
+        )
+        .build();
+
+    anemo_build::manual::Builder::new()
+        .out_dir(out_dir)
+        .compile(&[discovery]);
 }

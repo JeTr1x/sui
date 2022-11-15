@@ -1,11 +1,15 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use fastcrypto::traits::KeyPair;
 use rand::{prelude::StdRng, SeedableRng};
+use sui_storage::node_sync_store::NodeSyncStore;
 use sui_types::committee::Committee;
 use sui_types::crypto::get_key_pair;
 use sui_types::crypto::get_key_pair_from_rng;
-use sui_types::crypto::KeyPair;
+use sui_types::crypto::AccountKeyPair;
+use sui_types::crypto::AuthorityKeyPair;
+use sui_types::crypto::AuthorityPublicKeyBytes;
 use sui_types::messages_checkpoint::CheckpointRequest;
 use sui_types::messages_checkpoint::CheckpointResponse;
 
@@ -14,7 +18,13 @@ use crate::authority::authority_tests::*;
 use crate::authority::*;
 use crate::safe_client::SafeClient;
 
-use crate::authority_client::{AuthorityAPI, BatchInfoResponseItemStream};
+use crate::authority_client::{
+    AuthorityAPI, BatchInfoResponseItemStream, CheckpointStreamResponseItemStream,
+};
+use crate::checkpoints::CheckpointStore;
+use crate::checkpoints2::{CheckpointService, LogCheckpointOutput};
+use crate::epoch::committee_store::CommitteeStore;
+use crate::safe_client::SafeClientMetrics;
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use futures::stream;
@@ -24,51 +34,97 @@ use std::fs;
 use std::sync::Arc;
 use sui_types::messages::{
     AccountInfoRequest, AccountInfoResponse, BatchInfoRequest, BatchInfoResponseItem,
-    ConfirmationTransaction, ConsensusTransaction, ObjectInfoRequest, ObjectInfoResponse,
-    Transaction, TransactionInfoRequest, TransactionInfoResponse,
+    CertifiedTransaction, CheckpointStreamRequest, CommitteeInfoRequest, CommitteeInfoResponse,
+    ObjectInfoRequest, ObjectInfoResponse, Transaction, TransactionInfoRequest,
+    TransactionInfoResponse,
 };
-use sui_types::object::Object;
 
-pub(crate) fn init_state_parameters_from_rng<R>(rng: &mut R) -> (Committee, SuiAddress, KeyPair)
+use sui_macros::sim_test;
+use sui_simulator::nondeterministic;
+
+pub(crate) fn init_state_parameters_from_rng<R>(
+    rng: &mut R,
+) -> (Committee, SuiAddress, AuthorityKeyPair)
 where
     R: rand::CryptoRng + rand::RngCore,
 {
-    let (authority_address, authority_key) = get_key_pair_from_rng(rng);
-    let mut authorities = BTreeMap::new();
+    let (authority_address, authority_key): (_, AuthorityKeyPair) = get_key_pair_from_rng(rng);
+    let mut authorities: BTreeMap<AuthorityPublicKeyBytes, u64> = BTreeMap::new();
     authorities.insert(
-        /* address */ *authority_key.public_key_bytes(),
+        /* address */ authority_key.public().into(),
         /* voting right */ 1,
     );
-    let committee = Committee::new(0, authorities);
+    let committee = Committee::new(0, authorities).unwrap();
 
     (committee, authority_address, authority_key)
 }
 
 pub(crate) async fn init_state(
     committee: Committee,
-    authority_key: KeyPair,
+    authority_key: AuthorityKeyPair,
     store: Arc<AuthorityStore>,
 ) -> AuthorityState {
-    AuthorityState::new(
+    let name = authority_key.public().into();
+    let secrete = Arc::pin(authority_key);
+    let dir = env::temp_dir();
+    let epoch_path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
+    let checkpoint_path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
+    let checkpoint2_path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
+    let node_sync_path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
+    fs::create_dir(&epoch_path).unwrap();
+    let (tx_reconfigure_consensus, _rx_reconfigure_consensus) = tokio::sync::mpsc::channel(10);
+    let committee_store = Arc::new(CommitteeStore::new(epoch_path, &committee, None));
+    let checkpoint_store = Arc::new(parking_lot::Mutex::new(
+        CheckpointStore::open(
+            &checkpoint_path,
+            None,
+            &committee,
+            name,
+            secrete.clone(),
+            false,
+        )
+        .unwrap(),
+    ));
+
+    let node_sync_store = Arc::new(NodeSyncStore::open_tables_read_write(
+        node_sync_path,
+        None,
+        None,
+    ));
+
+    let checkpoint_service = CheckpointService::spawn(
+        &checkpoint2_path,
+        Box::new(store.clone()),
+        LogCheckpointOutput::boxed(),
+        LogCheckpointOutput::boxed_certified(),
         committee,
-        *authority_key.public_key_bytes(),
-        Arc::pin(authority_key),
+    );
+
+    AuthorityState::new(
+        name,
+        secrete,
         store,
+        node_sync_store,
+        committee_store,
         None,
         None,
+        None,
+        checkpoint_store,
         &sui_config::genesis::Genesis::get_default_genesis(),
-        false,
+        &prometheus::Registry::new(),
+        tx_reconfigure_consensus,
+        checkpoint_service,
     )
     .await
 }
 
-#[tokio::test]
+#[sim_test]
 async fn test_open_manager() {
     // let (_, authority_key) = get_key_pair();
 
     // Create a random directory to store the DB
     let dir = env::temp_dir();
-    let path = dir.join(format!("DB_{:?}", ObjectID::random()));
+    let path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
     fs::create_dir(&path).unwrap();
 
     let seed = [1u8; 32];
@@ -77,7 +133,7 @@ async fn test_open_manager() {
         init_state_parameters_from_rng(&mut StdRng::from_seed(seed));
     {
         // Create an authority
-        let store = Arc::new(AuthorityStore::open(&path, None));
+        let store = Arc::new(AuthorityStore::open(&path, None).unwrap());
         let mut authority_state = init_state(committee, authority_key, store.clone()).await;
 
         // TEST 1: init from an empty database should return to a zero block
@@ -91,18 +147,24 @@ async fn test_open_manager() {
         //         when we re-open the database.
 
         store
+            .perpetual_tables
             .executed_sequence
             .insert(&0, &ExecutionDigests::random())
             .expect("no error on write");
         drop(store);
         drop(authority_state);
     }
+
+    // TODO: The right fix is to invoke some function on DBMap and release the rocksdb arc references
+    // being held in the background thread but this will suffice for now
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
     // drop all
     let (committee, _, authority_key) =
         init_state_parameters_from_rng(&mut StdRng::from_seed(seed));
     {
         // Create an authority
-        let store = Arc::new(AuthorityStore::open(&path, None));
+        let store = Arc::new(AuthorityStore::open(&path, None).unwrap());
         let mut authority_state = init_state(committee, authority_key, store.clone()).await;
 
         let last_block = authority_state
@@ -113,18 +175,23 @@ async fn test_open_manager() {
 
         // TEST 3: If the database contains out of order transactions we just make a block with gaps
         store
+            .perpetual_tables
             .executed_sequence
             .insert(&2, &ExecutionDigests::random())
             .expect("no error on write");
         drop(store);
         drop(authority_state);
     }
+    // TODO: The right fix is to invoke some function on DBMap and release the rocksdb arc references
+    // being held in the background thread but this will suffice for now
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
     // drop all
     let (committee, _, authority_key) =
         init_state_parameters_from_rng(&mut StdRng::from_seed(seed));
     {
         // Create an authority
-        let store = Arc::new(AuthorityStore::open(&path, None));
+        let store = Arc::new(AuthorityStore::open(&path, None).unwrap());
         let mut authority_state = init_state(committee, authority_key, store.clone()).await;
 
         let last_block = authority_state.init_batches_from_database().unwrap();
@@ -137,15 +204,16 @@ async fn test_open_manager() {
     }
 }
 
-#[tokio::test]
+#[sim_test]
 async fn test_batch_manager_happy_path() {
+    telemetry_subscribers::init_for_testing();
     // Create a random directory to store the DB
     let dir = env::temp_dir();
-    let path = dir.join(format!("DB_{:?}", ObjectID::random()));
+    let path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
     fs::create_dir(&path).unwrap();
 
     // Create an authority
-    let store = Arc::new(AuthorityStore::open(&path, None));
+    let store = Arc::new(AuthorityStore::open(&path, None).unwrap());
 
     // Make a test key pair
     let seed = [1u8; 32];
@@ -156,7 +224,7 @@ async fn test_batch_manager_happy_path() {
     let inner_state = authority_state.clone();
     let _join = tokio::task::spawn(async move {
         inner_state
-            .run_batch_service(1000, Duration::from_millis(500))
+            .run_batch_service_once(1000, Duration::from_millis(500))
             .await
     });
 
@@ -164,8 +232,9 @@ async fn test_batch_manager_happy_path() {
 
     // Send a transaction.
     {
-        let t0 = &authority_state.batch_notifier.ticket().expect("ok");
+        let t0 = authority_state.batch_notifier.ticket(false).expect("ok");
         store.side_sequence(t0.seq(), &ExecutionDigests::random());
+        t0.notify();
     }
 
     // First we get a transaction update
@@ -179,9 +248,12 @@ async fn test_batch_manager_happy_path() {
     assert!(matches!(rx.recv().await.unwrap(), UpdateItem::Batch(_)));
 
     {
-        let t0 = &authority_state.batch_notifier.ticket().expect("ok");
+        let t0 = authority_state.batch_notifier.ticket(false).expect("ok");
         store.side_sequence(t0.seq(), &ExecutionDigests::random());
+        t0.notify();
     }
+
+    assert_eq!(authority_state.metrics.num_batch_service_tasks.get(), 1);
 
     // When we close the sending channel we also also end the service task
     authority_state.batch_notifier.close();
@@ -194,17 +266,28 @@ async fn test_batch_manager_happy_path() {
     assert!(matches!(rx.recv().await.unwrap(), UpdateItem::Batch(_)));
 
     _join.await.expect("No errors in task").expect("ok");
+
+    assert_eq!(authority_state.metrics.num_batch_service_tasks.get(), 0);
 }
 
-#[tokio::test]
+// get the next tx item, ignoring any batches that happen to come in.
+async fn get_next_tx(rx: &mut tokio::sync::broadcast::Receiver<UpdateItem>) -> UpdateItem {
+    loop {
+        if let UpdateItem::Transaction(tx) = rx.recv().await.unwrap() {
+            return UpdateItem::Transaction(tx);
+        }
+    }
+}
+
+#[sim_test]
 async fn test_batch_manager_out_of_order() {
     // Create a random directory to store the DB
     let dir = env::temp_dir();
-    let path = dir.join(format!("DB_{:?}", ObjectID::random()));
+    let path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
     fs::create_dir(&path).unwrap();
 
     // Create an authority
-    let store = Arc::new(AuthorityStore::open(&path, None));
+    let store = Arc::new(AuthorityStore::open(&path, None).unwrap());
 
     // Make a test key pair
     let seed = [1u8; 32];
@@ -215,40 +298,45 @@ async fn test_batch_manager_out_of_order() {
     let inner_state = authority_state.clone();
     let _join = tokio::task::spawn(async move {
         inner_state
-            .run_batch_service(1000, Duration::from_millis(500))
+            .run_batch_service_once(1000, Duration::from_millis(500))
             .await
     });
     // Send transactions out of order
     let mut rx = authority_state.subscribe_batch();
 
     {
-        let t0 = &authority_state.batch_notifier.ticket().expect("ok");
-        let t1 = &authority_state.batch_notifier.ticket().expect("ok");
-        let t2 = &authority_state.batch_notifier.ticket().expect("ok");
-        let t3 = &authority_state.batch_notifier.ticket().expect("ok");
+        let t0 = authority_state.batch_notifier.ticket(false).expect("ok");
+        let t1 = authority_state.batch_notifier.ticket(false).expect("ok");
+        let t2 = authority_state.batch_notifier.ticket(false).expect("ok");
+        let t3 = authority_state.batch_notifier.ticket(false).expect("ok");
 
         store.side_sequence(t1.seq(), &ExecutionDigests::random());
         store.side_sequence(t3.seq(), &ExecutionDigests::random());
         store.side_sequence(t2.seq(), &ExecutionDigests::random());
         store.side_sequence(t0.seq(), &ExecutionDigests::random());
+
+        t0.notify();
+        t1.notify();
+        t2.notify();
+        t3.notify();
     }
 
     // Get transactions in order then batch.
     assert!(matches!(
-        rx.recv().await.unwrap(),
+        get_next_tx(&mut rx).await,
         UpdateItem::Transaction((0, _))
     ));
 
     assert!(matches!(
-        rx.recv().await.unwrap(),
+        get_next_tx(&mut rx).await,
         UpdateItem::Transaction((1, _))
     ));
     assert!(matches!(
-        rx.recv().await.unwrap(),
+        get_next_tx(&mut rx).await,
         UpdateItem::Transaction((2, _))
     ));
     assert!(matches!(
-        rx.recv().await.unwrap(),
+        get_next_tx(&mut rx).await,
         UpdateItem::Transaction((3, _))
     ));
 
@@ -261,15 +349,15 @@ async fn test_batch_manager_out_of_order() {
     _join.await.expect("No errors in task").expect("ok");
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[sim_test]
 async fn test_batch_manager_drop_out_of_order() {
     // Create a random directory to store the DB
     let dir = env::temp_dir();
-    let path = dir.join(format!("DB_{:?}", ObjectID::random()));
+    let path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
     fs::create_dir(&path).unwrap();
 
     // Create an authority
-    let store = Arc::new(AuthorityStore::open(&path, None));
+    let store = Arc::new(AuthorityStore::open(&path, None).unwrap());
 
     // Make a test key pair
     let seed = [1u8; 32];
@@ -282,23 +370,23 @@ async fn test_batch_manager_drop_out_of_order() {
         inner_state
             // Make sure that a batch will not be formed due to time, but will be formed
             // when there are 4 transactions.
-            .run_batch_service(4, Duration::from_millis(10000))
+            .run_batch_service_once(4, Duration::from_millis(10000))
             .await
     });
     // Send transactions out of order
     let mut rx = authority_state.subscribe_batch();
 
-    let t0 = authority_state.batch_notifier.ticket().expect("ok");
-    let t1 = authority_state.batch_notifier.ticket().expect("ok");
-    let t2 = authority_state.batch_notifier.ticket().expect("ok");
-    let t3 = authority_state.batch_notifier.ticket().expect("ok");
+    let t0 = authority_state.batch_notifier.ticket(false).expect("ok");
+    let t1 = authority_state.batch_notifier.ticket(false).expect("ok");
+    let t2 = authority_state.batch_notifier.ticket(false).expect("ok");
+    let t3 = authority_state.batch_notifier.ticket(false).expect("ok");
 
     store.side_sequence(t1.seq(), &ExecutionDigests::random());
-    drop(t1);
+    t1.notify();
     store.side_sequence(t3.seq(), &ExecutionDigests::random());
-    drop(t3);
+    t3.notify();
     store.side_sequence(t2.seq(), &ExecutionDigests::random());
-    drop(t2);
+    t2.notify();
 
     // Give a chance to send signals
     tokio::task::yield_now().await;
@@ -306,24 +394,24 @@ async fn test_batch_manager_drop_out_of_order() {
     assert_eq!(rx.len(), 0);
 
     store.side_sequence(t0.seq(), &ExecutionDigests::random());
-    drop(t0);
+    t0.notify();
 
     // Get transactions in order then batch.
     assert!(matches!(
-        rx.recv().await.unwrap(),
+        get_next_tx(&mut rx).await,
         UpdateItem::Transaction((0, _))
     ));
 
     assert!(matches!(
-        rx.recv().await.unwrap(),
+        get_next_tx(&mut rx).await,
         UpdateItem::Transaction((1, _))
     ));
     assert!(matches!(
-        rx.recv().await.unwrap(),
+        get_next_tx(&mut rx).await,
         UpdateItem::Transaction((2, _))
     ));
     assert!(matches!(
-        rx.recv().await.unwrap(),
+        get_next_tx(&mut rx).await,
         UpdateItem::Transaction((3, _))
     ));
 
@@ -336,17 +424,17 @@ async fn test_batch_manager_drop_out_of_order() {
     _join.await.expect("No errors in task").expect("ok");
 }
 
-#[tokio::test]
+#[sim_test]
 async fn test_handle_move_order_with_batch() {
-    let (sender, sender_key) = get_key_pair();
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas_payment_object_id = ObjectID::random();
-    let gas_payment_object = Object::with_id_owner_for_testing(gas_payment_object_id, sender);
-    let authority_state = Arc::new(init_state_with_objects(vec![gas_payment_object]).await);
-
+    let (authority_state_, pkg_ref) =
+        init_state_with_ids_and_object_basics(vec![(sender, gas_payment_object_id)]).await;
+    let authority_state = Arc::new(authority_state_);
     let inner_state = authority_state.clone();
     let _join = tokio::task::spawn(async move {
         inner_state
-            .run_batch_service(1000, Duration::from_millis(500))
+            .run_batch_service_once(1000, Duration::from_millis(500))
             .await
     });
     // Send transactions out of order
@@ -355,6 +443,7 @@ async fn test_handle_move_order_with_batch() {
     tokio::task::yield_now().await;
 
     let effects = create_move_object(
+        &pkg_ref,
         &authority_state,
         &gas_payment_object_id,
         &sender,
@@ -377,117 +466,6 @@ async fn test_handle_move_order_with_batch() {
     _join.await.expect("No issues ending task.").expect("ok");
 }
 
-#[tokio::test]
-async fn test_batch_store_retrieval() {
-    // Create a random directory to store the DB
-    let dir = env::temp_dir();
-    let path = dir.join(format!("DB_{:?}", ObjectID::random()));
-    fs::create_dir(&path).unwrap();
-
-    // Create an authority
-    let store = Arc::new(AuthorityStore::open(&path, None));
-
-    // Make a test key pair
-    let seed = [1u8; 32];
-    let (committee, _, authority_key) =
-        init_state_parameters_from_rng(&mut StdRng::from_seed(seed));
-    let authority_state = Arc::new(init_state(committee, authority_key, store.clone()).await);
-
-    let inner_state = authority_state.clone();
-    let _join = tokio::task::spawn(async move {
-        inner_state
-            .run_batch_service(10, Duration::from_secs(6000))
-            .await
-    });
-    // Send transactions out of order
-    let tx_zero = ExecutionDigests::random();
-
-    let inner_store = store.clone();
-    for _i in 0u64..105 {
-        let t0 = &authority_state.batch_notifier.ticket().expect("ok");
-        inner_store
-            .executed_sequence
-            .insert(&t0.seq(), &tx_zero)
-            .expect("Failed to write.");
-    }
-
-    // Add a few out of order transactions that should be ignored
-    // NOTE: gap between 105 and 110
-    (105u64..110).into_iter().for_each(|_| {
-        let _ = &authority_state.batch_notifier.ticket().expect("ok");
-    });
-
-    for _i in 110u64..120 {
-        let t0 = &authority_state.batch_notifier.ticket().expect("ok");
-        inner_store
-            .executed_sequence
-            .insert(&t0.seq(), &tx_zero)
-            .expect("Failed to write.");
-    }
-
-    // Give a change to the channels to send.
-    tokio::task::yield_now().await;
-
-    // TEST 1: Get batches across boundaries
-
-    let (batches, transactions) = store
-        .batches_and_transactions(12, 34)
-        .expect("Retrieval failed!");
-
-    assert_eq!(4, batches.len());
-    assert_eq!(10, batches.first().unwrap().batch.next_sequence_number);
-    assert_eq!(40, batches.last().unwrap().batch.next_sequence_number);
-
-    assert_eq!(30, transactions.len());
-
-    // TEST 2: Get with range wihin batch
-    let (batches, transactions) = store
-        .batches_and_transactions(54, 56)
-        .expect("Retrieval failed!");
-
-    assert_eq!(2, batches.len());
-    assert_eq!(50, batches.first().unwrap().batch.next_sequence_number);
-    assert_eq!(60, batches.last().unwrap().batch.next_sequence_number);
-
-    assert_eq!(10, transactions.len());
-
-    // TEST 3: Get on boundary
-    let (batches, transactions) = store
-        .batches_and_transactions(30, 50)
-        .expect("Retrieval failed!");
-
-    assert_eq!(3, batches.len());
-    assert_eq!(30, batches.first().unwrap().batch.next_sequence_number);
-    assert_eq!(50, batches.last().unwrap().batch.next_sequence_number);
-
-    assert_eq!(20, transactions.len());
-
-    // TEST 4: Get past the end
-    let (batches, transactions) = store
-        .batches_and_transactions(94, 120)
-        .expect("Retrieval failed!");
-
-    assert_eq!(3, batches.len());
-    assert_eq!(90, batches.first().unwrap().batch.next_sequence_number);
-    assert_eq!(115, batches.last().unwrap().batch.next_sequence_number);
-
-    assert_eq!(25, transactions.len());
-
-    // TEST 5: Both past the end
-    let (batches, transactions) = store
-        .batches_and_transactions(123, 222)
-        .expect("Retrieval failed!");
-
-    assert_eq!(1, batches.len());
-    assert_eq!(115, batches.first().unwrap().batch.next_sequence_number);
-
-    assert_eq!(5, transactions.len());
-
-    // When we close the sending channel we also also end the service task
-    authority_state.batch_notifier.close();
-    _join.await.expect("No errors in task").expect("ok");
-}
-
 #[derive(Clone)]
 struct TrustworthyAuthorityClient(Arc<Mutex<AuthorityState>>);
 
@@ -504,20 +482,9 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
         })
     }
 
-    async fn handle_confirmation_transaction(
+    async fn handle_certificate(
         &self,
-        _transaction: ConfirmationTransaction,
-    ) -> Result<TransactionInfoResponse, SuiError> {
-        Ok(TransactionInfoResponse {
-            signed_transaction: None,
-            certified_transaction: None,
-            signed_effects: None,
-        })
-    }
-
-    async fn handle_consensus_transaction(
-        &self,
-        _transaction: ConsensusTransaction,
+        _certificate: CertifiedTransaction,
     ) -> Result<TransactionInfoResponse, SuiError> {
         Ok(TransactionInfoResponse {
             signed_transaction: None,
@@ -566,6 +533,13 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
         unimplemented!();
     }
 
+    async fn handle_checkpoint_stream(
+        &self,
+        _request: CheckpointStreamRequest,
+    ) -> Result<CheckpointStreamResponseItemStream, SuiError> {
+        unimplemented!();
+    }
+
     /// Handle Batch information requests for this authority.
     async fn handle_batch_stream(
         &self,
@@ -578,7 +552,7 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
         let mut items = Vec::new();
         let mut last_batch = AuthorityBatch::initial();
         items.push({
-            let item = SignedBatch::new(last_batch.clone(), &*secret, name);
+            let item = SignedBatch::new_with_zero_epoch(last_batch.clone(), &*secret, name);
             BatchInfoResponseItem(UpdateItem::Batch(item))
         });
         let mut seq = 0;
@@ -594,7 +568,7 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
             let new_batch = AuthorityBatch::make_next(&last_batch, &transactions).unwrap();
             last_batch = new_batch;
             items.push({
-                let item = SignedBatch::new(last_batch.clone(), &*secret, name);
+                let item = SignedBatch::new_with_zero_epoch(last_batch.clone(), &*secret, name);
                 BatchInfoResponseItem(UpdateItem::Batch(item))
             });
         }
@@ -605,6 +579,13 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
             items.pop().map(|item| (Ok(item), items))
         });
         Ok(Box::pin(stream))
+    }
+
+    async fn handle_committee_info_request(
+        &self,
+        _request: CommitteeInfoRequest,
+    ) -> Result<CommitteeInfoResponse, SuiError> {
+        unimplemented!();
     }
 }
 
@@ -630,20 +611,9 @@ impl AuthorityAPI for ByzantineAuthorityClient {
         })
     }
 
-    async fn handle_confirmation_transaction(
+    async fn handle_certificate(
         &self,
-        _transaction: ConfirmationTransaction,
-    ) -> Result<TransactionInfoResponse, SuiError> {
-        Ok(TransactionInfoResponse {
-            signed_transaction: None,
-            certified_transaction: None,
-            signed_effects: None,
-        })
-    }
-
-    async fn handle_consensus_transaction(
-        &self,
-        _transaction: ConsensusTransaction,
+        _certificate: CertifiedTransaction,
     ) -> Result<TransactionInfoResponse, SuiError> {
         Ok(TransactionInfoResponse {
             signed_transaction: None,
@@ -689,6 +659,13 @@ impl AuthorityAPI for ByzantineAuthorityClient {
         &self,
         _request: CheckpointRequest,
     ) -> Result<CheckpointResponse, SuiError> {
+        unimplemented!()
+    }
+
+    async fn handle_checkpoint_stream(
+        &self,
+        _request: CheckpointStreamRequest,
+    ) -> Result<CheckpointStreamResponseItemStream, SuiError> {
         unimplemented!();
     }
 
@@ -705,7 +682,7 @@ impl AuthorityAPI for ByzantineAuthorityClient {
         let mut items = Vec::new();
         let mut last_batch = AuthorityBatch::initial();
         items.push({
-            let item = SignedBatch::new(last_batch.clone(), &*secret, name);
+            let item = SignedBatch::new_with_zero_epoch(last_batch.clone(), &*secret, name);
             BatchInfoResponseItem(UpdateItem::Batch(item))
         });
         let mut seq = 0;
@@ -727,7 +704,7 @@ impl AuthorityAPI for ByzantineAuthorityClient {
             let new_batch = AuthorityBatch::make_next(&last_batch, &transactions).unwrap();
             last_batch = new_batch;
             items.push({
-                let item = SignedBatch::new(last_batch.clone(), &*secret, name);
+                let item = SignedBatch::new_with_zero_epoch(last_batch.clone(), &*secret, name);
                 BatchInfoResponseItem(UpdateItem::Batch(item))
             });
         }
@@ -739,6 +716,13 @@ impl AuthorityAPI for ByzantineAuthorityClient {
         });
         Ok(Box::pin(stream))
     }
+
+    async fn handle_committee_info_request(
+        &self,
+        _request: CommitteeInfoRequest,
+    ) -> Result<CommitteeInfoResponse, SuiError> {
+        unimplemented!();
+    }
 }
 
 impl ByzantineAuthorityClient {
@@ -747,37 +731,33 @@ impl ByzantineAuthorityClient {
     }
 }
 
-#[tokio::test]
+#[sim_test]
 async fn test_safe_batch_stream() {
     // Create a random directory to store the DB
     let dir = env::temp_dir();
-    let path = dir.join(format!("DB_{:?}", ObjectID::random()));
+    let path = dir.join(format!("DB_{:?}", nondeterministic!(ObjectID::random())));
     fs::create_dir(&path).unwrap();
 
-    let (_, authority_key) = get_key_pair();
-    let mut authorities = BTreeMap::new();
-    let public_key_bytes = *authority_key.public_key_bytes();
+    let (_, authority_key): (_, AuthorityKeyPair) = get_key_pair();
+    let mut authorities: BTreeMap<AuthorityPublicKeyBytes, u64> = BTreeMap::new();
+    let public_key_bytes = authority_key.public().into();
     println!("init public key {:?}", public_key_bytes);
 
     authorities.insert(public_key_bytes, 1);
-    let committee = Committee::new(0, authorities);
+    let committee = Committee::new(0, authorities).unwrap();
     // Create an authority
-    let store = Arc::new(AuthorityStore::open(&path, None));
-    let state = AuthorityState::new(
-        committee.clone(),
-        public_key_bytes,
-        Arc::pin(authority_key),
-        store.clone(),
-        None,
-        None,
-        &sui_config::genesis::Genesis::get_default_genesis(),
-        false,
-    )
-    .await;
+    let store = Arc::new(AuthorityStore::open(&path.join("store"), None).unwrap());
+    let state = init_state(committee.clone(), authority_key, store).await;
+    let committee_store = state.committee_store().clone();
 
     // Happy path:
     let auth_client = TrustworthyAuthorityClient::new(state);
-    let safe_client = SafeClient::new(auth_client, committee.clone(), public_key_bytes);
+    let safe_client = SafeClient::new(
+        auth_client,
+        committee_store,
+        public_key_bytes,
+        Arc::new(SafeClientMetrics::new_for_tests()),
+    );
 
     let request = BatchInfoRequest {
         start: Some(0),
@@ -807,24 +787,25 @@ async fn test_safe_batch_stream() {
     assert!(!error_found);
 
     // Byzantine cases:
-    let (_, authority_key) = get_key_pair();
-    let public_key_bytes_b = *authority_key.public_key_bytes();
-    let state_b = AuthorityState::new(
+    let (_, authority_key): (_, AuthorityKeyPair) = get_key_pair();
+    let (tx_reconfigure_consensus, _rx_reconfigure_consensus) = tokio::sync::mpsc::channel(10);
+    let state_b = AuthorityState::new_for_testing(
         committee.clone(),
-        public_key_bytes_b,
-        Arc::pin(authority_key),
-        store,
+        &authority_key,
         None,
         None,
-        &sui_config::genesis::Genesis::get_default_genesis(),
-        false,
+        None,
+        tx_reconfigure_consensus,
     )
     .await;
+    let committee_store = state_b.committee_store().clone();
     let auth_client_from_byzantine = ByzantineAuthorityClient::new(state_b);
+    let public_key_bytes_b = authority_key.public().into();
     let safe_client_from_byzantine = SafeClient::new(
         auth_client_from_byzantine,
-        committee.clone(),
+        committee_store,
         public_key_bytes_b,
+        Arc::new(SafeClientMetrics::new_for_tests()),
     );
 
     let mut batch_stream = safe_client_from_byzantine

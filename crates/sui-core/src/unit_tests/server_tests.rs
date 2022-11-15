@@ -1,12 +1,14 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use crate::{
     authority::authority_tests::init_state_with_object_id,
     authority_client::{
-        AuthorityAPI, LocalAuthorityClient, LocalAuthorityClientFaultConfig, NetworkAuthorityClient,
+        AuthorityAPI, LocalAuthorityClient, LocalAuthorityClientFaultConfig,
+        NetworkAuthorityClient, NetworkAuthorityClientMetrics,
     },
+    safe_client::SafeClientMetrics,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -19,40 +21,6 @@ use sui_types::{
 use crate::safe_client::SafeClient;
 use typed_store::Map;
 
-#[tokio::test]
-async fn test_start_stop_batch_subsystem() {
-    let sender = dbg_addr(1);
-    let object_id = dbg_object_id(1);
-    let mut authority_state = init_state_with_object_id(sender, object_id).await;
-    authority_state
-        .init_batches_from_database()
-        .expect("Init batches failed!");
-
-    // The following two fields are only needed for shared objects (not by this bench).
-    let consensus_address = "/ip4/127.0.0.1/tcp/0/http".parse().unwrap();
-    let (tx_consensus_listener, _rx_consensus_listener) = tokio::sync::mpsc::channel(1);
-
-    let server = Arc::new(AuthorityServer::new(
-        "/ip4/127.0.0.1/tcp/999/http".parse().unwrap(),
-        Arc::new(authority_state),
-        consensus_address,
-        tx_consensus_listener,
-    ));
-    let join = server
-        .spawn_batch_subsystem(1000, Duration::from_secs(50))
-        .await
-        .expect("Problem launching subsystem.");
-
-    // Now drop the server to simulate the authority server ending processing.
-    server.state.batch_notifier.close();
-    drop(server);
-
-    // This should return immediately.
-    join.await
-        .expect("Error stopping subsystem")
-        .expect("Subsystem crashed?");
-}
-
 //This is the most basic example of how to test the server logic
 #[tokio::test]
 async fn test_simple_request() {
@@ -64,18 +32,21 @@ async fn test_simple_request() {
     let consensus_address = "/ip4/127.0.0.1/tcp/0/http".parse().unwrap();
     let (tx_consensus_listener, _rx_consensus_listener) = tokio::sync::mpsc::channel(1);
 
-    let server = AuthorityServer::new(
+    let server = AuthorityServer::new_for_test(
         "/ip4/127.0.0.1/tcp/0/http".parse().unwrap(),
         Arc::new(authority_state),
         consensus_address,
         tx_consensus_listener,
     );
 
-    let server_handle = server.spawn().await.unwrap();
+    let server_handle = server.spawn_for_test().await.unwrap();
 
-    let client = NetworkAuthorityClient::connect(server_handle.address())
-        .await
-        .unwrap();
+    let client = NetworkAuthorityClient::connect(
+        server_handle.address(),
+        Arc::new(NetworkAuthorityClientMetrics::new_for_tests()),
+    )
+    .await
+    .unwrap();
 
     let req = ObjectInfoRequest::latest_object_info_request(
         object_id,
@@ -96,7 +67,7 @@ async fn test_subscription() {
     let (tx_consensus_listener, _rx_consensus_listener) = tokio::sync::mpsc::channel(1);
 
     // Start the batch server
-    let mut server = AuthorityServer::new(
+    let mut server = AuthorityServer::new_for_test(
         "/ip4/127.0.0.1/tcp/0/http".parse().unwrap(),
         Arc::new(authority_state),
         consensus_address,
@@ -110,20 +81,25 @@ async fn test_subscription() {
     let db3 = server.state.db().clone();
     let state = server.state.clone();
 
-    let server_handle = server.spawn().await.unwrap();
+    let server_handle = server.spawn_for_test().await.unwrap();
 
-    let client = NetworkAuthorityClient::connect(server_handle.address())
-        .await
-        .unwrap();
+    let client = NetworkAuthorityClient::connect(
+        server_handle.address(),
+        Arc::new(NetworkAuthorityClientMetrics::new_for_tests()),
+    )
+    .await
+    .unwrap();
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let tx_zero = ExecutionDigests::random();
     for _i in 0u64..105 {
-        let ticket = state.batch_notifier.ticket().expect("all good");
-        db.executed_sequence
+        let ticket = state.batch_notifier.ticket(false).expect("all good");
+        db.perpetual_tables
+            .executed_sequence
             .insert(&ticket.seq(), &tx_zero)
             .expect("Failed to write.");
+        ticket.notify();
     }
     println!("Sent tickets.");
 
@@ -148,7 +124,7 @@ async fn test_subscription() {
         match item {
             BatchInfoResponseItem(UpdateItem::Batch(signed_batch)) => {
                 num_batches += 1;
-                if signed_batch.batch.next_sequence_number >= 34 {
+                if signed_batch.data().next_sequence_number >= 34 {
                     break;
                 }
             }
@@ -170,11 +146,16 @@ async fn test_subscription() {
     let _handle2 = tokio::spawn(async move {
         for i in 105..120 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let ticket = inner_server2.batch_notifier.ticket().expect("all good");
-            db2.executed_sequence
+            let ticket = inner_server2
+                .batch_notifier
+                .ticket(false)
+                .expect("all good");
+            db2.perpetual_tables
+                .executed_sequence
                 .insert(&ticket.seq(), &tx_zero)
                 .expect("Failed to write.");
             println!("Send item {i}");
+            ticket.notify();
         }
     });
 
@@ -198,7 +179,7 @@ async fn test_subscription() {
         match item {
             BatchInfoResponseItem(UpdateItem::Batch(signed_batch)) => {
                 num_batches += 1;
-                if signed_batch.batch.next_sequence_number >= 112 {
+                if signed_batch.data().next_sequence_number >= 112 {
                     break;
                 }
             }
@@ -210,6 +191,7 @@ async fn test_subscription() {
     }
 
     assert_eq!(3, num_batches);
+
     // On Linux, this is 20 because the batch forms continuously from 100 to 109,
     // and then from 110 to 119.
     // while On Mac, this is 15 because the batch stops at 105, and then restarts
@@ -242,8 +224,12 @@ async fn test_subscription() {
 
     loop {
         // Send a transaction
-        let ticket = inner_server2.batch_notifier.ticket().expect("all good");
-        db3.executed_sequence
+        let ticket = inner_server2
+            .batch_notifier
+            .ticket(false)
+            .expect("all good");
+        db3.perpetual_tables
+            .executed_sequence
             .insert(&ticket.seq(), &tx_zero)
             .expect("Failed to write.");
         println!("Send item {i}");
@@ -254,9 +240,9 @@ async fn test_subscription() {
         if let Some(data) = resp.next().await {
             match data.expect("No error expected here") {
                 BatchInfoResponseItem(UpdateItem::Batch(signed_batch)) => {
-                    println!("Batch(next={})", signed_batch.batch.next_sequence_number);
+                    println!("Batch(next={})", signed_batch.data().next_sequence_number);
                     num_batches += 1;
-                    if signed_batch.batch.next_sequence_number >= 129 {
+                    if signed_batch.data().next_sequence_number >= 129 {
                         break;
                     }
                 }
@@ -266,6 +252,7 @@ async fn test_subscription() {
                 }
             }
         }
+        ticket.notify();
     }
 
     assert!(num_batches >= 2);
@@ -286,7 +273,7 @@ async fn test_subscription_safe_client() {
 
     // Start the batch server
     let state = Arc::new(authority_state);
-    let server = Arc::new(AuthorityServer::new(
+    let server = Arc::new(AuthorityServer::new_for_test(
         "/ip4/127.0.0.1/tcp/998/http".parse().unwrap(),
         state.clone(),
         consensus_address,
@@ -302,8 +289,9 @@ async fn test_subscription_safe_client() {
             state: state.clone(),
             fault_config: LocalAuthorityClientFaultConfig::default(),
         },
-        state.clone_committee(),
+        state.committee_store().clone(),
         state.name,
+        Arc::new(SafeClientMetrics::new_for_tests()),
     );
 
     let _join = server
@@ -315,12 +303,13 @@ async fn test_subscription_safe_client() {
 
     let tx_zero = ExecutionDigests::random();
     for _i in 0u64..105 {
-        let ticket = server.state.batch_notifier.ticket().expect("all good");
-        db.executed_sequence
+        let ticket = server.state.batch_notifier.ticket(false).expect("all good");
+        db.perpetual_tables
+            .executed_sequence
             .insert(&ticket.seq(), &tx_zero)
             .expect("Failed to write.");
-        drop(ticket);
         tokio::time::sleep(Duration::from_millis(10)).await;
+        ticket.notify();
     }
     println!("Sent tickets.");
 
@@ -351,7 +340,7 @@ async fn test_subscription_safe_client() {
         match data.expect("Bad response") {
             BatchInfoResponseItem(UpdateItem::Batch(signed_batch)) => {
                 num_batches += 1;
-                if signed_batch.batch.next_sequence_number >= 34 {
+                if signed_batch.data().next_sequence_number >= 34 {
                     break;
                 }
             }
@@ -376,12 +365,14 @@ async fn test_subscription_safe_client() {
             let ticket = inner_server2
                 .state
                 .batch_notifier
-                .ticket()
+                .ticket(false)
                 .expect("all good");
-            db2.executed_sequence
+            db2.perpetual_tables
+                .executed_sequence
                 .insert(&ticket.seq(), &tx_zero)
                 .expect("Failed to write.");
             println!("Send item {i}");
+            ticket.notify();
         }
     });
 
@@ -405,9 +396,9 @@ async fn test_subscription_safe_client() {
     while let Some(data) = stream1.next().await {
         match &data.expect("No error") {
             BatchInfoResponseItem(UpdateItem::Batch(signed_batch)) => {
-                println!("Batch(next={})", signed_batch.batch.next_sequence_number);
+                println!("Batch(next={})", signed_batch.data().next_sequence_number);
                 num_batches += 1;
-                if signed_batch.batch.next_sequence_number >= 112 {
+                if signed_batch.data().next_sequence_number >= 112 {
                     break;
                 }
             }
@@ -448,28 +439,33 @@ async fn test_subscription_safe_client() {
         let ticket = inner_server2
             .state
             .batch_notifier
-            .ticket()
+            .ticket(false)
             .expect("all good");
-        db3.executed_sequence
+        db3.perpetual_tables
+            .executed_sequence
             .insert(&ticket.seq(), &tx_zero)
             .expect("Failed to write.");
         println!("Send item {i}");
         i += 1;
         tokio::time::sleep(Duration::from_millis(20)).await;
+        ticket.notify();
+        if i > 129 {
+            break;
+        }
+    }
 
-        // Then we wait to receive
-        if let Some(data) = stream1.next().await {
-            match data.expect("Bad response") {
-                BatchInfoResponseItem(UpdateItem::Batch(signed_batch)) => {
-                    num_batches += 1;
-                    if signed_batch.batch.next_sequence_number >= 129 {
-                        break;
-                    }
+    // Then we wait to receive
+    while let Some(data) = stream1.next().await {
+        match data.expect("Bad response") {
+            BatchInfoResponseItem(UpdateItem::Batch(signed_batch)) => {
+                num_batches += 1;
+                if signed_batch.data().next_sequence_number >= 129 {
+                    break;
                 }
-                BatchInfoResponseItem(UpdateItem::Transaction((seq, _digest))) => {
-                    println!("Received {seq}");
-                    num_transactions += 1;
-                }
+            }
+            BatchInfoResponseItem(UpdateItem::Transaction((seq, _digest))) => {
+                println!("Received {seq}");
+                num_transactions += 1;
             }
         }
     }

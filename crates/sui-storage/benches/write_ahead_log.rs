@@ -1,4 +1,4 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
@@ -15,16 +15,18 @@ fn main() {
         .build()
         .unwrap();
 
-    let working_dir = tempfile::tempdir().unwrap();
-    let wal = Arc::new(DBWriteAheadLog::<usize>::new(working_dir));
-
     let num_tasks = 20000;
     let num_txes_per_task = 10;
 
-    let start = std::time::Instant::now();
-
     // TODO: this is not a very good benchmark but perhaps it can at least find regressions
-    runtime.block_on(async move {
+    let duration = runtime.block_on(async move {
+        let working_dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(DBWriteAheadLog::<usize>::new(
+            working_dir.path().to_path_buf(),
+        ));
+
+        let start = std::time::Instant::now();
+
         let mut futures = Vec::new();
         for _ in 0..num_tasks {
             let wal = wal.clone();
@@ -33,10 +35,8 @@ fn main() {
                     let tx = TransactionDigest::random();
                     let g = wal.begin_tx(&tx, &0).await.unwrap();
 
-                    if let Some(g) = g {
-                        sleep(Duration::from_millis(1)).await;
-                        g.commit_tx().unwrap();
-                    }
+                    sleep(Duration::from_millis(1)).await;
+                    g.commit_tx();
                 }
             }));
         }
@@ -44,9 +44,9 @@ fn main() {
         while let Some(f) = futures.pop() {
             f.await.unwrap();
         }
-    });
 
-    let duration = start.elapsed();
+        start.elapsed()
+    });
 
     println!(
         "WriteAheadLog throughput: {} txes/s",

@@ -1,12 +1,16 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+extern crate core;
+
+use std::collections::btree_map::Entry::Occupied;
 use std::collections::BTreeMap;
 
 use schemars::gen::{SchemaGenerator, SchemaSettings};
 use schemars::schema::SchemaObject;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// OPEN-RPC documentation following the OpenRPC specification https://spec.open-rpc.org
 /// The implementation is partial, only required fields and subset of optional fields
@@ -21,6 +25,7 @@ pub struct Project {
 
 impl Project {
     pub fn new(
+        version: &str,
         title: &str,
         description: &str,
         contact_name: &str,
@@ -29,7 +34,6 @@ impl Project {
         license: &str,
         license_url: &str,
     ) -> Self {
-        let version = env!("CARGO_PKG_VERSION").to_owned();
         let openrpc = "1.2.6".to_string();
         Self {
             openrpc,
@@ -45,7 +49,7 @@ impl Project {
                     name: license.to_string(),
                     url: Some(license_url.to_string()),
                 }),
-                version,
+                version: version.to_owned(),
                 ..Default::default()
             },
             methods: vec![],
@@ -65,6 +69,34 @@ impl Project {
         self.components
             .content_descriptors
             .extend(module.components.content_descriptors);
+    }
+
+    pub fn add_examples(&mut self, mut example_provider: BTreeMap<String, Vec<ExamplePairing>>) {
+        for method in &mut self.methods {
+            if let Occupied(entry) = example_provider.entry(method.name.clone()) {
+                let examples = entry.remove();
+                let param_names = method
+                    .params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>();
+
+                // Make sure example's parameters are correct.
+                for example in examples.iter() {
+                    let example_param_names = example
+                        .params
+                        .iter()
+                        .map(|param| param.name.clone())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        param_names, example_param_names,
+                        "Provided example parameters doesn't match the function parameters."
+                    );
+                }
+
+                method.examples = examples
+            }
+        }
     }
 }
 
@@ -103,13 +135,61 @@ struct Method {
     params: Vec<ContentDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<ContentDescriptor>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    examples: Vec<ExamplePairing>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct ExamplePairing {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    params: Vec<Example>,
+    result: Example,
+}
+
+impl ExamplePairing {
+    pub fn new(name: &str, params: Vec<(&str, Value)>, result: Value) -> Self {
+        Self {
+            name: name.to_string(),
+            description: None,
+            summary: None,
+            params: params
+                .into_iter()
+                .map(|(name, value)| Example {
+                    name: name.to_string(),
+                    summary: None,
+                    description: None,
+                    value,
+                })
+                .collect(),
+            result: Example {
+                name: "Result".to_string(),
+                summary: None,
+                description: None,
+                value: result,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct Example {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    value: Value,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct Tag {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    summery: Option<String>,
+    summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
 }
@@ -153,12 +233,6 @@ struct License {
 
 impl Default for RpcModuleDocBuilder {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RpcModuleDocBuilder {
-    pub fn new() -> Self {
         let schema_generator = SchemaSettings::default()
             .with(|s| {
                 s.definitions_path = "#/components/schemas/".to_string();
@@ -171,7 +245,9 @@ impl RpcModuleDocBuilder {
             content_descriptors: BTreeMap::new(),
         }
     }
+}
 
+impl RpcModuleDocBuilder {
     pub fn build(mut self) -> Module {
         Module {
             methods: self.methods.into_values().collect(),
@@ -196,6 +272,7 @@ impl RpcModuleDocBuilder {
         result: Option<ContentDescriptor>,
         doc: &str,
         tag: Option<String>,
+        is_pubsub: bool,
     ) {
         let description = if doc.trim().is_empty() {
             None
@@ -203,6 +280,28 @@ impl RpcModuleDocBuilder {
             Some(doc.trim().to_string())
         };
         let name = format!("{}_{}", namespace, name);
+        let mut tags = tag
+            .map(|t| Tag {
+                name: t,
+                summary: None,
+                description: None,
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        if is_pubsub {
+            tags.push(Tag {
+                name: "Websocket".to_string(),
+                summary: None,
+                description: None,
+            });
+            tags.push(Tag {
+                name: "PubSub".to_string(),
+                summary: None,
+                description: None,
+            });
+        }
+
         self.methods.insert(
             name.clone(),
             Method {
@@ -210,14 +309,8 @@ impl RpcModuleDocBuilder {
                 description,
                 params,
                 result,
-                tags: tag
-                    .map(|t| Tag {
-                        name: t,
-                        summery: None,
-                        description: None,
-                    })
-                    .into_iter()
-                    .collect(),
+                tags,
+                examples: Vec::new(),
             },
         );
     }

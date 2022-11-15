@@ -1,5 +1,5 @@
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use serde_json::json;
@@ -8,48 +8,59 @@ use std::{collections::HashSet, path::Path};
 use signature::Signer;
 use typed_store::Map;
 
-use sui_framework::build_move_package_to_bytes;
-use sui_types::crypto::KeyPair;
+use sui_framework_build::compiled_package::BuildConfig;
+use sui_types::crypto::{AccountKeyPair, Signature};
 use sui_types::gas_coin::GasCoin;
 use sui_types::messages::Transaction;
 use sui_types::object::{Object, GAS_VALUE_FOR_TESTING};
 use sui_types::{crypto::get_key_pair, object::Owner};
 
 use crate::authority_aggregator::authority_aggregator_tests::{
-    authority_genesis_objects, crate_object_move_transaction, get_local_client,
-    init_local_authorities,
+    crate_object_move_transaction, get_local_client, init_local_authorities,
 };
 use crate::authority_client::LocalAuthorityClient;
 use crate::gateway_state::{GatewayAPI, GatewayState};
 
 use super::*;
 
-async fn create_gateway_state(
-    genesis_objects: Vec<Vec<Object>>,
-) -> GatewayState<LocalAuthorityClient> {
+async fn create_gateway_state_with_object_basics_ref(
+    genesis_objects: Vec<Object>,
+) -> (GatewayState<LocalAuthorityClient>, ObjectRef) {
     let all_owners: HashSet<_> = genesis_objects
         .iter()
-        .flat_map(|v| v.iter().map(|o| o.get_single_owner().unwrap()))
+        .map(|o| o.get_single_owner().unwrap())
         .collect();
-    let (authorities, _) = init_local_authorities(genesis_objects).await;
+    let (authorities, _, pkg_ref) = init_local_authorities(4, genesis_objects).await;
     let path = tempfile::tempdir().unwrap().into_path();
-    let gateway = GatewayState::new_with_authorities(path, authorities).unwrap();
+    let gateway_store = Arc::new(GatewayStore::open(&path, None).unwrap());
+    let gateway = GatewayState::new_with_authorities(
+        gateway_store,
+        authorities,
+        GatewayMetrics::new_for_tests(),
+    )
+    .unwrap();
     for owner in all_owners {
         gateway.sync_account_state(owner).await.unwrap();
     }
-    gateway
+    (gateway, pkg_ref)
 }
 
-async fn transfer_coin(
+async fn create_gateway_state(genesis_objects: Vec<Object>) -> GatewayState<LocalAuthorityClient> {
+    create_gateway_state_with_object_basics_ref(genesis_objects)
+        .await
+        .0
+}
+
+async fn public_transfer_object(
     gateway: &GatewayState<LocalAuthorityClient>,
     signer: SuiAddress,
-    key: &KeyPair,
+    key: &AccountKeyPair,
     coin_object_id: ObjectID,
     gas_object_id: ObjectID,
     recipient: SuiAddress,
-) -> Result<TransactionEffectsResponse, anyhow::Error> {
+) -> Result<SuiTransactionResponse, anyhow::Error> {
     let data = gateway
-        .transfer_coin(
+        .public_transfer_object(
             signer,
             coin_object_id,
             Some(gas_object_id),
@@ -60,25 +71,23 @@ async fn transfer_coin(
 
     let signature = key.sign(&data.to_bytes());
     let result = gateway
-        .execute_transaction(Transaction::new(data, signature))
-        .await?
-        .to_effect_response()?;
+        .execute_transaction(Transaction::from_data(data, signature))
+        .await?;
     Ok(result)
 }
 
-#[tokio::test]
-async fn test_transfer_coin() {
-    let (addr1, key1) = get_key_pair();
-    let (addr2, _key2) = get_key_pair();
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_public_transfer_object() {
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
+    let (addr2, _key2): (_, AccountKeyPair) = get_key_pair();
 
     let coin_object = Object::with_owner_for_testing(addr1);
     let gas_object = Object::with_owner_for_testing(addr1);
 
-    let genesis_objects =
-        authority_genesis_objects(4, vec![coin_object.clone(), gas_object.clone()]);
+    let genesis_objects = vec![coin_object.clone(), gas_object.clone()];
     let gateway = create_gateway_state(genesis_objects).await;
 
-    let effects = transfer_coin(
+    let effects = public_transfer_object(
         &gateway,
         addr1,
         &key1,
@@ -99,26 +108,23 @@ async fn test_transfer_coin() {
 
 #[tokio::test]
 async fn test_move_call() {
-    let (addr1, key1) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
     let gas_object = Object::with_owner_for_testing(addr1);
-    let genesis_objects = authority_genesis_objects(4, vec![gas_object.clone()]);
-    let gateway = create_gateway_state(genesis_objects).await;
+    let genesis_objects = vec![gas_object.clone()];
+    let (gateway, pkg_ref) = create_gateway_state_with_object_basics_ref(genesis_objects).await;
 
-    let framework_obj_ref = gateway.get_framework_object_ref().await.unwrap();
     let tx = crate_object_move_transaction(
         addr1,
         &key1,
         addr1,
         100,
-        framework_obj_ref,
+        pkg_ref,
         gas_object.compute_object_reference(),
     );
 
     let effects = gateway
-        .execute_transaction(tx)
+        .execute_transaction(tx.into_inner())
         .await
-        .unwrap()
-        .to_effect_response()
         .unwrap()
         .effects;
     assert!(effects.status.is_ok());
@@ -129,16 +135,19 @@ async fn test_move_call() {
 
 #[tokio::test]
 async fn test_publish() {
-    let (addr1, key1) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
     let gas_object = Object::with_owner_for_testing(addr1);
-    let genesis_objects = authority_genesis_objects(4, vec![gas_object.clone()]);
+    let genesis_objects = vec![gas_object.clone()];
     let gateway = create_gateway_state(genesis_objects).await;
 
     // Provide path to well formed package sources
     let mut path = env!("CARGO_MANIFEST_DIR").to_owned();
     path.push_str("/src/unit_tests/data/object_owner/");
 
-    let compiled_modules = build_move_package_to_bytes(Path::new(&path), false).unwrap();
+    let compiled_modules = BuildConfig::default()
+        .build(Path::new(&path).to_path_buf())
+        .unwrap()
+        .get_package_bytes();
     let data = gateway
         .publish(
             addr1,
@@ -151,22 +160,19 @@ async fn test_publish() {
 
     let signature = key1.sign(&data.to_bytes());
     gateway
-        .execute_transaction(Transaction::new(data, signature))
+        .execute_transaction(Transaction::from_data(data, signature))
         .await
-        .unwrap()
-        .to_publish_response()
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_coin_split() {
-    let (addr1, key1) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
 
     let coin_object = Object::with_owner_for_testing(addr1);
     let gas_object = Object::with_owner_for_testing(addr1);
 
-    let genesis_objects =
-        authority_genesis_objects(4, vec![coin_object.clone(), gas_object.clone()]);
+    let genesis_objects = vec![coin_object.clone(), gas_object.clone()];
     let gateway = create_gateway_state(genesis_objects).await;
 
     let split_amounts = vec![100, 200, 300, 400, 500];
@@ -185,8 +191,10 @@ async fn test_coin_split() {
 
     let signature = key1.sign(&data.to_bytes());
     let response = gateway
-        .execute_transaction(Transaction::new(data, signature))
+        .execute_transaction(Transaction::from_data(data, signature))
         .await
+        .unwrap()
+        .parsed_data
         .unwrap()
         .to_split_coin_response()
         .unwrap();
@@ -214,13 +222,12 @@ async fn test_coin_split() {
 
 #[tokio::test]
 async fn test_coin_split_insufficient_gas() {
-    let (addr1, key1) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
 
     let coin_object = Object::with_owner_for_testing(addr1);
     let gas_object = Object::with_owner_for_testing(addr1);
 
-    let genesis_objects =
-        authority_genesis_objects(4, vec![coin_object.clone(), gas_object.clone()]);
+    let genesis_objects = vec![coin_object.clone(), gas_object.clone()];
     let gateway = create_gateway_state(genesis_objects).await;
 
     let split_amounts = vec![100, 200, 300, 400, 500];
@@ -238,16 +245,19 @@ async fn test_coin_split_insufficient_gas() {
 
     let signature = key1.sign(&data.to_bytes());
     let response = gateway
-        .execute_transaction(Transaction::new(data, signature))
+        .execute_transaction(Transaction::from_data(data, signature))
         .await;
     // Tx should fail due to out of gas, and no transactions should remain pending.
     // Objects are not locked either.
     assert!(response.is_err());
-    assert_eq!(gateway.store().pending_transactions().iter().count(), 0);
+    assert_eq!(
+        gateway.store().epoch_tables().transactions.iter().count(),
+        0
+    );
     assert_eq!(
         gateway
             .store()
-            .get_transaction_envelope(&gas_object.compute_object_reference())
+            .get_object_locking_transaction(&gas_object.compute_object_reference())
             .await
             .unwrap(),
         None
@@ -256,19 +266,16 @@ async fn test_coin_split_insufficient_gas() {
 
 #[tokio::test]
 async fn test_coin_merge() {
-    let (addr1, key1) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
 
     let coin_object1 = Object::with_owner_for_testing(addr1);
     let coin_object2 = Object::with_owner_for_testing(addr1);
     let gas_object = Object::with_owner_for_testing(addr1);
-    let genesis_objects = authority_genesis_objects(
-        4,
-        vec![
-            coin_object1.clone(),
-            coin_object2.clone(),
-            gas_object.clone(),
-        ],
-    );
+    let genesis_objects = vec![
+        coin_object1.clone(),
+        coin_object2.clone(),
+        gas_object.clone(),
+    ];
     let gateway = create_gateway_state(genesis_objects).await;
 
     let data = gateway
@@ -284,8 +291,10 @@ async fn test_coin_merge() {
 
     let signature = key1.sign(&data.to_bytes());
     let response = gateway
-        .execute_transaction(Transaction::new(data, signature))
+        .execute_transaction(Transaction::from_data(data, signature))
         .await
+        .unwrap()
+        .parsed_data
         .unwrap()
         .to_merge_coin_response()
         .unwrap();
@@ -303,92 +312,59 @@ async fn test_coin_merge() {
 }
 
 #[tokio::test]
-async fn test_recent_transactions() -> Result<(), anyhow::Error> {
-    let (addr1, key1) = get_key_pair();
-    let (addr2, _) = get_key_pair();
-
-    let object1 = Object::with_owner_for_testing(addr1);
-    let object2 = Object::with_owner_for_testing(addr1);
-    let object3 = Object::with_owner_for_testing(addr1);
-    let gas_object = Object::with_owner_for_testing(addr1);
-    let genesis_objects = authority_genesis_objects(
-        4,
-        vec![
-            object1.clone(),
-            object2.clone(),
-            object3.clone(),
-            gas_object.clone(),
-        ],
-    );
+async fn test_pay_sui_empty_input_coins() -> Result<(), anyhow::Error> {
+    let (addr1, _): (_, AccountKeyPair) = get_key_pair();
+    let (recipient, _): (_, AccountKeyPair) = get_key_pair();
+    let coin_object = Object::with_owner_for_testing(addr1);
+    let genesis_objects = vec![coin_object.clone()];
     let gateway = create_gateway_state(genesis_objects).await;
 
-    assert_eq!(gateway.get_total_transaction_number()?, 0);
-    let mut cnt = 0;
-    let mut digests = vec![];
-    for obj_id in [object1.id(), object2.id(), object3.id()] {
-        let data = gateway
-            .transfer_coin(addr1, obj_id, Some(gas_object.id()), 50000, addr2)
-            .await
-            .unwrap();
-        let signature = key1.sign(&data.to_bytes());
-        let response = gateway
-            .execute_transaction(Transaction::new(data, signature))
-            .await?;
-        digests.push((
-            cnt,
-            response
-                .to_effect_response()?
-                .certificate
-                .transaction_digest,
-        ));
-        cnt += 1;
-        assert_eq!(gateway.get_total_transaction_number()?, cnt);
-    }
-    // start must <= end.
-    assert!(gateway.get_transactions_in_range(2, 1).is_err());
-    assert!(gateway.get_transactions_in_range(1, 1).unwrap().is_empty());
-    // Extends max range allowed.
-    assert!(gateway.get_transactions_in_range(1, 100000).is_err());
-    let txs = gateway.get_recent_transactions(10)?;
-    assert_eq!(txs.len(), 3);
-    assert_eq!(txs, digests);
-    let txs = gateway.get_transactions_in_range(0, 10)?;
-    assert_eq!(txs.len(), 3);
-    assert_eq!(txs, digests);
+    let res = gateway
+        .pay_sui(addr1, vec![], vec![recipient], vec![100], 1000)
+        .await;
+    assert!(res.is_err());
+    Ok(())
+}
 
+#[tokio::test]
+async fn test_pay_all_sui_empty_input_coins() -> Result<(), anyhow::Error> {
+    let (addr1, _): (_, AccountKeyPair) = get_key_pair();
+    let (recipient, _): (_, AccountKeyPair) = get_key_pair();
+    let coin_object = Object::with_owner_for_testing(addr1);
+    let genesis_objects = vec![coin_object.clone()];
+    let gateway = create_gateway_state(genesis_objects).await;
+
+    let res = gateway.pay_all_sui(addr1, vec![], recipient, 1000).await;
+    assert!(res.is_err());
     Ok(())
 }
 
 #[tokio::test]
 async fn test_equivocation_resilient() {
-    let (addr1, key1) = get_key_pair();
+    telemetry_subscribers::init_for_testing();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
     let coin_object = Object::with_owner_for_testing(addr1);
-    let gas_object = Object::with_owner_for_testing(addr1);
-    let genesis_objects =
-        authority_genesis_objects(4, vec![coin_object.clone(), gas_object.clone()]);
+    let genesis_objects = vec![coin_object.clone()];
     let gateway = Arc::new(Box::new(create_gateway_state(genesis_objects).await));
 
     let mut handles = vec![];
     // We create 20 requests that try to touch the same object to the gateway.
     // Make sure that one of them succeeds and there are no pending tx in the end.
     for _ in 0..20 {
-        let (recipient, _) = get_key_pair();
-        let data = gateway
-            .transfer_coin(
-                addr1,
-                coin_object.id(),
-                Some(gas_object.id()),
-                GAS_VALUE_FOR_TESTING,
-                recipient,
-            )
-            .await
-            .unwrap();
-        let signature = key1.sign(&data.to_bytes());
+        let (recipient, _): (_, AccountKeyPair) = get_key_pair();
+        let data = TransactionData::new_transfer_sui(
+            recipient,
+            addr1,
+            None,
+            coin_object.compute_object_reference(),
+            1000,
+        );
+        let signature: Signature = key1.sign(&data.to_bytes());
         let handle = tokio::task::spawn({
             let gateway_copy = gateway.clone();
             async move {
                 gateway_copy
-                    .execute_transaction(Transaction::new(data, signature))
+                    .execute_transaction(Transaction::from_data(data, signature))
                     .await
             }
         });
@@ -402,19 +378,25 @@ async fn test_equivocation_resilient() {
             .count(),
         1
     );
-    assert_eq!(gateway.store().pending_transactions().iter().count(), 0);
+    println!(
+        "{:?}",
+        gateway.store().epoch_tables().transactions.iter().next()
+    );
+    assert_eq!(
+        gateway.store().epoch_tables().transactions.iter().count(),
+        0
+    );
 }
 
 #[tokio::test]
-async fn test_transfer_coin_with_retry() {
-    let (addr1, key1) = get_key_pair();
-    let (addr2, _key2) = get_key_pair();
+async fn test_public_transfer_object_with_retry() {
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
+    let (addr2, _key2): (_, AccountKeyPair) = get_key_pair();
 
     let coin_object = Object::with_owner_for_testing(addr1);
     let gas_object = Object::with_owner_for_testing(addr1);
 
-    let genesis_objects =
-        authority_genesis_objects(4, vec![coin_object.clone(), gas_object.clone()]);
+    let genesis_objects = vec![coin_object.clone(), gas_object.clone()];
     let mut gateway = create_gateway_state(genesis_objects).await;
     // Make two authorities fail at the end of certificate processing.
     get_local_client(&mut gateway.authorities, 0)
@@ -425,7 +407,7 @@ async fn test_transfer_coin_with_retry() {
         .fail_after_handle_confirmation = true;
 
     // Transfer will fail because we would not be able to reach quorum on cert processing.
-    assert!(transfer_coin(
+    assert!(public_transfer_object(
         &gateway,
         addr1,
         &key1,
@@ -440,17 +422,21 @@ async fn test_transfer_coin_with_retry() {
     // transactions table.
     // However objects in the transaction should no longer be locked since we reset
     // them at the last failed retry.
-    assert_eq!(gateway.store().pending_transactions().iter().count(), 1);
+    assert_eq!(
+        gateway.store().epoch_tables().transactions.iter().count(),
+        1
+    );
     let (tx_digest, tx) = gateway
         .store()
-        .pending_transactions()
+        .epoch_tables()
+        .transactions
         .iter()
         .next()
         .unwrap();
     assert_eq!(
         gateway
             .store()
-            .get_transaction_envelope(&coin_object.compute_object_reference())
+            .get_object_locking_transaction(&coin_object.compute_object_reference())
             .await
             .unwrap(),
         None,
@@ -463,10 +449,8 @@ async fn test_transfer_coin_with_retry() {
 
     // Retry transaction, and this time it should succeed.
     let effects = gateway
-        .execute_transaction(tx)
+        .execute_transaction(tx.into_inner())
         .await
-        .unwrap()
-        .to_effect_response()
         .unwrap()
         .effects;
     let oref = effects.mutated_excluding_gas().next().unwrap();
@@ -474,15 +458,22 @@ async fn test_transfer_coin_with_retry() {
     let new_owner = &oref.owner;
     assert_eq!(new_owner, &Owner::AddressOwner(addr2));
 
-    assert_eq!(gateway.store().pending_transactions().iter().count(), 0);
+    assert_eq!(
+        gateway.store().epoch_tables().transactions.iter().count(),
+        0
+    );
     assert!(gateway
         .store()
-        .get_transaction_envelope(&coin_object.compute_object_reference())
+        .get_object_locking_transaction(&coin_object.compute_object_reference())
         .await
         .is_err());
     assert!(gateway.store().effects_exists(&tx_digest).unwrap());
     // The transaction is deleted after this is done.
-    assert!(!gateway.store().transaction_exists(&tx_digest).unwrap());
+    assert!(gateway
+        .store()
+        .get_transaction(&tx_digest)
+        .unwrap()
+        .is_none());
     assert_eq!(gateway.store().next_sequence_number().unwrap(), 1);
     assert_eq!(
         gateway
@@ -521,9 +512,9 @@ async fn test_transfer_coin_with_retry() {
 
 #[tokio::test]
 async fn test_get_owner_object() {
-    let (addr1, key1) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
     let gas_object = Object::with_owner_for_testing(addr1);
-    let genesis_objects = authority_genesis_objects(4, vec![gas_object.clone()]);
+    let genesis_objects = vec![gas_object.clone()];
     let gateway = create_gateway_state(genesis_objects).await;
 
     // Provide path to well formed package sources
@@ -531,7 +522,10 @@ async fn test_get_owner_object() {
     path.push_str("/src/unit_tests/data/object_owner/");
 
     // Publish object_owner package
-    let compiled_modules = build_move_package_to_bytes(Path::new(&path), false).unwrap();
+    let compiled_modules = BuildConfig::default()
+        .build(Path::new(&path).to_path_buf())
+        .unwrap()
+        .get_package_bytes();
     let data = gateway
         .publish(
             addr1,
@@ -544,8 +538,10 @@ async fn test_get_owner_object() {
 
     let signature = key1.sign(&data.to_bytes());
     let response = gateway
-        .execute_transaction(Transaction::new(data, signature))
+        .execute_transaction(Transaction::from_data(data, signature))
         .await
+        .unwrap()
+        .parsed_data
         .unwrap()
         .to_publish_response()
         .unwrap();
@@ -567,10 +563,8 @@ async fn test_get_owner_object() {
         .unwrap();
     let signature = key1.sign(&data.to_bytes());
     let response = gateway
-        .execute_transaction(Transaction::new(data, signature))
+        .execute_transaction(Transaction::from_data(data, signature))
         .await
-        .unwrap()
-        .to_effect_response()
         .unwrap();
     let parent = &response.effects.created.first().unwrap().reference;
     let data = gateway
@@ -588,10 +582,8 @@ async fn test_get_owner_object() {
         .unwrap();
     let signature = key1.sign(&data.to_bytes());
     let response = gateway
-        .execute_transaction(Transaction::new(data, signature))
+        .execute_transaction(Transaction::from_data(data, signature))
         .await
-        .unwrap()
-        .to_effect_response()
         .unwrap();
     let child = &response.effects.created.first().unwrap().reference;
 
@@ -613,16 +605,21 @@ async fn test_get_owner_object() {
         .await
         .unwrap();
     let signature = key1.sign(&data.to_bytes());
-    gateway
-        .execute_transaction(Transaction::new(data, signature))
+    let response = gateway
+        .execute_transaction(Transaction::from_data(data, signature))
         .await
-        .unwrap()
-        .to_effect_response()
         .unwrap();
+    let field_object = &response.effects.created.first().unwrap().reference;
 
     // Query get_objects_owned_by_object
     let objects = gateway
         .get_objects_owned_by_object(parent.object_id)
+        .await
+        .unwrap();
+    assert_eq!(1, objects.len());
+    assert_eq!(field_object.object_id, objects.first().unwrap().object_id);
+    let objects = gateway
+        .get_objects_owned_by_object(field_object.object_id)
         .await
         .unwrap();
     assert_eq!(1, objects.len());
@@ -638,28 +635,30 @@ async fn test_get_owner_object() {
 
 #[tokio::test]
 async fn test_multiple_gateways() {
-    let (addr1, key1) = get_key_pair();
-    let (addr2, _key2) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
+    let (addr2, _key2): (_, AccountKeyPair) = get_key_pair();
 
     let coin_object1 = Object::with_owner_for_testing(addr1);
     let coin_object2 = Object::with_owner_for_testing(addr1);
     let coin_object3 = Object::with_owner_for_testing(addr1);
     let gas_object = Object::with_owner_for_testing(addr1);
 
-    let genesis_objects = authority_genesis_objects(
-        4,
-        vec![
-            coin_object1.clone(),
-            coin_object2.clone(),
-            coin_object3.clone(),
-            gas_object.clone(),
-        ],
-    );
+    let genesis_objects = vec![
+        coin_object1.clone(),
+        coin_object2.clone(),
+        coin_object3.clone(),
+        gas_object.clone(),
+    ];
     let gateway1 = create_gateway_state(genesis_objects).await;
     let path = tempfile::tempdir().unwrap().into_path();
     // gateway2 shares the same set of authorities as gateway1.
-    let gateway2 = GatewayState::new_with_authorities(path, gateway1.authorities.clone()).unwrap();
-    let response = transfer_coin(
+    let gateway2 = GatewayState::new_with_authorities(
+        Arc::new(GatewayStore::open(&path, None).unwrap()),
+        gateway1.authorities.clone(),
+        GatewayMetrics::new_for_tests(),
+    )
+    .unwrap();
+    let response = public_transfer_object(
         &gateway1,
         addr1,
         &key1,
@@ -673,7 +672,7 @@ async fn test_multiple_gateways() {
 
     // gas_object on gateway2 should be out-of-dated.
     // Show that we can still handle the transaction successfully if we use it on gateway2.
-    let response = transfer_coin(
+    let response = public_transfer_object(
         &gateway2,
         addr1,
         &key1,
@@ -686,7 +685,7 @@ async fn test_multiple_gateways() {
     assert!(response.effects.status.is_ok());
 
     // Now we try to use the same gas object on gateway1, and it will still work.
-    let response = transfer_coin(
+    let response = public_transfer_object(
         &gateway1,
         addr1,
         &key1,
@@ -697,4 +696,44 @@ async fn test_multiple_gateways() {
     .await
     .unwrap();
     assert!(response.effects.status.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_batch_transaction() {
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
+    let (addr2, _key2): (_, AccountKeyPair) = get_key_pair();
+
+    let coin_object1 = Object::with_owner_for_testing(addr1);
+    let coin_object2 = Object::with_owner_for_testing(addr1);
+    let gas_object = Object::with_owner_for_testing(addr1);
+
+    let genesis_objects = vec![
+        coin_object1.clone(),
+        coin_object2.clone(),
+        gas_object.clone(),
+    ];
+    let gateway = create_gateway_state(genesis_objects).await;
+    let params = vec![
+        RPCTransactionRequestParams::TransferObjectRequestParams(TransferObjectParams {
+            object_id: coin_object1.id(),
+            recipient: addr2,
+        }),
+        RPCTransactionRequestParams::TransferObjectRequestParams(TransferObjectParams {
+            object_id: coin_object2.id(),
+            recipient: addr2,
+        }),
+    ];
+    // Gateway should be able to figure out the only usable gas object.
+    let data = gateway
+        .batch_transaction(addr1, params, None, 5000)
+        .await
+        .unwrap();
+    let signature = key1.sign(&data.to_bytes());
+    let effects = gateway
+        .execute_transaction(Transaction::from_data(data, signature))
+        .await
+        .unwrap()
+        .effects;
+    assert!(effects.created.is_empty());
+    assert_eq!(effects.mutated.len(), 3);
 }

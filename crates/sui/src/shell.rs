@@ -1,7 +1,9 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::anyhow;
+use std::borrow::Cow;
+use std::borrow::Cow::Owned;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::env;
@@ -54,8 +56,8 @@ impl<P: Display, S: Send, H: AsyncHandler<S>> Shell<P, S, H> {
 
     pub async fn run_async(
         &mut self,
-        out: &mut dyn Write,
-        err: &mut dyn Write,
+        out: &mut (dyn Write + Send),
+        err: &mut (dyn Write + Send),
     ) -> Result<(), anyhow::Error> {
         let config = Config::builder()
             .auto_add_history(true)
@@ -73,9 +75,6 @@ impl<P: Display, S: Send, H: AsyncHandler<S>> Shell<P, S, H> {
         }));
 
         loop {
-            write!(out, "{}", self.prompt)?;
-            out.flush()?;
-
             // Read a line
             let readline = rl.readline(&self.prompt.to_string());
             let line = match readline {
@@ -196,7 +195,15 @@ impl Hinter for ShellHelper {
     type Hint = String;
 }
 
-impl Highlighter for ShellHelper {}
+impl Highlighter for ShellHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        Owned(prompt.bold().green().to_string())
+    }
+}
 
 impl Validator for ShellHelper {}
 
@@ -299,12 +306,9 @@ impl CommandStructure {
     }
 
     fn get_child(&self, name: &str) -> Option<&CommandStructure> {
-        for subcommand in self.children.iter() {
-            if subcommand.name == name {
-                return Some(subcommand);
-            }
-        }
-        None
+        self.children
+            .iter()
+            .find(|&subcommand| subcommand.name == name)
     }
 }
 

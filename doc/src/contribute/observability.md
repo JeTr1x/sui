@@ -2,13 +2,9 @@
 title: Logging, Tracing, Metrics, and Observability
 ---
 
-Good observability facilities are key to the development and growth of Sui. This is made
-more challenging by the distributed and asynchronous nature of Sui, with multiple client and validator
-processes distributed over a potentially global network.
+Good observability capabilities are key to the development and growth of Sui. This is made more challenging by the distributed and asynchronous nature of Sui, with multiple client and validator processes distributed over a potentially global network.
 
-The observability stack in Sui is based on the [Tokio tracing](https://tokio.rs/blog/2019-08-tracing) library.
-The rest of this document highlights specific aspects of achieving good observability through structured logging
-and metrics in Sui.
+The observability stack in Sui is based on the [Tokio tracing](https://tokio.rs/blog/2019-08-tracing) library. The rest of this document highlights specific aspects of achieving good observability through structured logging and metrics in Sui.
 
 NOTE: The output here is largely for the consumption of Sui operators, administrators, and developers. The
 content of logs and traces do not represent the authoritative, certified output of validators and are subject
@@ -34,7 +30,7 @@ Here is a table/summary of context information that we will want:
 
 - TX Digest
 - Object reference/ID, when applicable
-- Address/account
+- Address
 - Certificate digest, if applicable
 - For Client HTTP endpoint: route, method, status
 - Epoch
@@ -193,8 +189,8 @@ To see nested spans visualized with [Jaeger](https://www.jaegertracing.io), do t
    ```shell
    $ SUI_TRACING_ENABLE=1 RUST_LOG="info,sui_core=trace" ./sui start
    ```
-1. Run some transfers with wallet, or run the benchmarking tool.
-4. Browse to `http://localhost:16686/` and select Sui as the service.
+1. Run some transfers with Sui CLI client, or run the benchmarking tool.
+1. Browse to `http://localhost:16686/` and select Sui as the service.
 
 > **Note:** Separate spans (which are not nested) are not connected as a single trace for now.
 
@@ -203,7 +199,42 @@ To see nested spans visualized with [Jaeger](https://www.jaegertracing.io), do t
 [Tokio-console](https://github.com/tokio-rs/console) is an awesome CLI tool designed to analyze and help debug Rust apps using Tokio, in real time! It relies on a special subscriber.
 
 1. Build Sui using a special flag: `RUSTFLAGS="--cfg tokio_unstable" cargo build`.
-2. Start Sui with `SUI_TOKIO_CONSOLE` set to 1.
-3. Clone the console repo and `cargo run` to launch the console.
+1. Start Sui with `SUI_TOKIO_CONSOLE` set to 1.
+1. Clone the console repo and `cargo run` to launch the console.
 
 > **Note:** Adding Tokio-console support may significantly slow down Sui validators/gateways.
+
+### Memory profiling
+
+Sui uses the [jemalloc memory allocator](https://jemalloc.net/) by default on most platforms, and there is code that enables automatic
+memory profiling using jemalloc's sampling profiler, which is very lightweight and designed for production
+use.  The profiling code spits out profiles at most every 5 minutes, and only when total memory has increased
+by a default 20%.  Profiling files are named `jeprof.<TIMESTAMP>.<memorysize>MB.prof` so that it is easy to 
+correlate to metrics and incidents, for ease of debugging.
+
+For the memory profiling to work, you need to set the environment variable `_RJEM_MALLOC_CONF=prof:true`. 
+(If you use the [Docker image](https://hub.docker.com/r/mysten/sui-node), they are set automatically)
+
+Note that running some allocator-based heap profilers such as [Bytehound](https://github.com/koute/bytehound) will essentially disable
+automatic jemalloc profiling, because they interfere with or don't implement `jemalloc_ctl` stats APIs.
+
+To view the profile files, one needs to do the following, on the same platform as where the profiles were gathered:
+1. Install `libunwind`, the `dot` utility from graphviz, and jeprof.  On Debian: `apt-get install libjemalloc-dev libunwind-dev graphviz`.
+2. Build with debug symbols: `cargo build --profile bench-profiling`
+2. cd to `$SUI_REPO/target/bench-profiling`
+1. Run `jeprof --svg sui-node jeprof.xxyyzz.heap` - select the heap profile based on 
+   timestamp and memory size in the filename.
+
+Note: with automatic memory profiling, it is no longer necessary to configure environment variables beyond
+what is required above.  It is possible to configure custom profiling options, see the links below:
+
+* [Heap Profiling](https://github.com/jemalloc/jemalloc/wiki/Use-Case%3A-Heap-Profiling)
+* [heap profiling with jemallocator](https://gist.github.com/ordian/928dc2bd45022cddd547528f64db9174)
+
+For example, set `_RJEM_MALLOC_CONF` to:
+`prof:true,lg_prof_interval:24,lg_prof_sample:19`
+
+The preceding setting means: turn on profiling, sample every 2^19 or 512KB bytes allocated,
+and dump out the profile every 2^24 or 16MB of memory allocated. 
+However, the automatic profiling is designed to produce files that are better named and at less intervals,
+so overriding the default configuration is not usually recommended.

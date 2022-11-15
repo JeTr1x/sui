@@ -2,20 +2,16 @@
 
 This is a proof-of-concept Move standard library for Sui (`sources/`), along with several examples of programs that Sui users might want to write (`examples`). `custom_object_template.move` is a good starting point for understanding the proposed model.
 
-### Setup
+To set up and build the [Sui CLI client](https://docs.sui.io/build/cli-client) needed for Move development, follow the instructions to [install Sui](https://docs.sui.io/build/install).
 
-```
-# install Move CLI
-cargo install --git https://github.com/diem/diem move-cli --branch main
-# put it in your PATH
-export PATH="$PATH:~/.cargo/bin"
-```
+## To add a new native Move function
 
-For reading/editing Move, your best bet is vscode + this [plugin](https://marketplace.visualstudio.com/items?itemName=move.move-analyzer).
+1. Add a new `./sui-framework/{name}.move` file or find an appropriate `.move`.
+2. Add the signature of the function you are adding in `{name}.move`. 
+3. Add the rust implementation of the function under `./sui-framework/src/natives` with name `{name}.rs`.
+4. Link the move interface with the native function in [all_natives](https://github.com/MystenLabs/sui/blob/main/crates/sui-framework/src/natives/mod.rs#L23)
+5. Write some tests in `{name}_tests.move` and pass `run_framework_move_unit_tests`.
+6. Optionally, update the mock move VM value in [gas_tests.rs](https://github.com/MystenLabs/sui/blob/276356e168047cdfce71814cb14403f4653a3656/crates/sui-core/src/unit_tests/gas_tests.rs) since the sui-framework package will increase the gas metering.
+7. Optionally, run `cargo insta test` and `cargo insta review` since the sui-framework build will change the empty genesis config.
 
-### Building
-
-```
-# Inside the sui_programmability/framework dir
-move package -d build
-```
+Note: The gas metering for native functions is currently a WIP; use a dummy value for now and please open an issue with `move` label.

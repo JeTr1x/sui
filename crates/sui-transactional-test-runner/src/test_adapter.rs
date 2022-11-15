@@ -1,10 +1,10 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module contains the transactional test runner instantiation for the Sui adapter
 
-use crate::{args::*, in_memory_storage::InMemoryStorage};
-use anyhow::{anyhow, bail};
+use crate::args::*;
+use anyhow::bail;
 use bimap::btree::BiBTreeMap;
 use move_binary_format::{file_format::CompiledScript, CompiledModule};
 use move_bytecode_utils::module_cache::GetModule;
@@ -37,23 +37,24 @@ use std::{
     sync::Arc,
 };
 use sui_adapter::{adapter::new_move_vm, genesis};
-use sui_core::transaction_input_checker::InputObjects;
-use sui_core::{authority::AuthorityTemporaryStore, execution_engine};
+use sui_core::{execution_engine, test_utils::to_sender_signed_transaction};
 use sui_framework::DEFAULT_FRAMEWORK_PATH;
+use sui_types::in_memory_storage::InMemoryStorage;
+use sui_types::temporary_store::TemporaryStore;
 use sui_types::{
     base_types::{
         ObjectDigest, ObjectID, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest,
         SUI_ADDRESS_LENGTH,
     },
-    crypto::{get_key_pair_from_rng, KeyPair, Signature},
-    error::SuiError,
+    crypto::{get_key_pair_from_rng, AccountKeyPair},
     event::Event,
     gas,
-    messages::{ExecutionStatus, Transaction, TransactionData, TransactionEffects},
+    messages::{
+        ExecutionStatus, InputObjects, TransactionData, TransactionEffects, VerifiedTransaction,
+    },
     object::{self, Object, ObjectFormatOptions, GAS_VALUE_FOR_TESTING},
     MOVE_STDLIB_ADDRESS, SUI_FRAMEWORK_ADDRESS,
 };
-
 pub(crate) type FakeID = u64;
 
 // initial value for fake object ID mapping
@@ -69,7 +70,7 @@ pub struct SuiTestAdapter<'a> {
     pub(crate) storage: Arc<InMemoryStorage>,
     native_functions: NativeFunctionTable,
     pub(crate) compiled_state: CompiledState<'a>,
-    accounts: BTreeMap<String, (SuiAddress, KeyPair)>,
+    accounts: BTreeMap<String, (SuiAddress, AccountKeyPair)>,
     default_syntax: SyntaxChoice,
     object_enumeration: BiBTreeMap<ObjectID, FakeID>,
     next_fake: FakeID,
@@ -129,13 +130,12 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter<'a> {
             .collect::<BTreeMap<_, _>>();
 
         let mut named_address_mapping = NAMED_ADDRESSES.clone();
-        let additional_mapping =
-            additional_mapping
-                .into_iter()
-                .chain(accounts.iter().map(|(n, (addr, _))| {
-                    let addr = NumericalAddress::new(addr.to_inner(), NumberFormat::Hex);
-                    (n.clone(), addr)
-                }));
+        let additional_mapping = additional_mapping.into_iter().chain(accounts.iter().map(
+            |(n, (addr, _)): (_, &(_, AccountKeyPair))| {
+                let addr = NumericalAddress::new(addr.to_inner(), NumberFormat::Hex);
+                (n.clone(), addr)
+            },
+        ));
         for (name, addr) in additional_mapping {
             if named_address_mapping.contains_key(&name) || name == "sui" {
                 panic!("Invalid init. The named address '{}' is reserved", name)
@@ -348,19 +348,27 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter<'a> {
             stop_line: _,
             data: _,
         } = task;
-        match command {
-            SuiSubcommand::ViewObject(ViewObjectCommand { id: fake_id }) => {
-                let id = match self.fake_to_real_object_id(fake_id) {
-                    None => panic!(
+        macro_rules! get_obj {
+            ($fake_id:ident) => {{
+                let id = match self.fake_to_real_object_id($fake_id) {
+                    None => bail!(
                         "task {}, lines {}-{}. Unbound fake id {}",
-                        number, start_line, command_lines_stop, fake_id
+                        number,
+                        start_line,
+                        command_lines_stop,
+                        $fake_id
                     ),
                     Some(res) => res,
                 };
-                let obj = match self.storage.get_object(&id) {
-                    None => return Ok(Some(format!("No object at id {}", fake_id))),
+                match self.storage.get_object(&id) {
+                    None => return Ok(Some(format!("No object at id {}", $fake_id))),
                     Some(obj) => obj,
-                };
+                }
+            }};
+        }
+        match command {
+            SuiSubcommand::ViewObject(ViewObjectCommand { id: fake_id }) => {
+                let obj = get_obj!(fake_id);
                 Ok(Some(match &obj.data {
                     object::Data::Move(move_obj) => {
                         let layout = move_obj
@@ -369,8 +377,10 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter<'a> {
                         let move_struct =
                             MoveStruct::simple_deserialize(move_obj.contents(), &layout).unwrap();
                         self.stabilize_str(format!(
-                            "Owner: {}\nContents: {}",
-                            &obj.owner, move_struct
+                            "Owner: {}\nVersion: {}\nContents: {}",
+                            &obj.owner,
+                            obj.version().value(),
+                            move_struct
                         ))
                     }
                     object::Data::Package(package) => {
@@ -390,6 +400,26 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter<'a> {
                     }
                 }))
             }
+            SuiSubcommand::TransferObject(TransferObjectCommand {
+                id: fake_id,
+                recipient,
+                sender,
+                gas_budget,
+            }) => {
+                let obj = get_obj!(fake_id);
+                let obj_ref = obj.compute_object_reference();
+                let recipient = match self.accounts.get(&recipient) {
+                    Some((recipient, _)) => *recipient,
+                    None => panic!("Unbound account {}", recipient),
+                };
+                let gas_budget = gas_budget.unwrap_or(GAS_VALUE_FOR_TESTING);
+                let transaction = self.sign_txn(sender, |sender, gas| {
+                    TransactionData::new_transfer(recipient, obj_ref, sender, gas, gas_budget)
+                });
+                let summary = self.execute_txn(transaction, gas_budget)?;
+                let output = self.object_summary_output(&summary, false);
+                Ok(output)
+            }
         }
     }
 }
@@ -399,8 +429,9 @@ impl<'a> SuiTestAdapter<'a> {
         &mut self,
         sender: Option<String>,
         txn_data: impl FnOnce(/* sender */ SuiAddress, /* gas */ ObjectRef) -> TransactionData,
-    ) -> Transaction {
+    ) -> VerifiedTransaction {
         let gas_object_id = ObjectID::new(self.rng.gen());
+        assert!(!self.object_enumeration.contains_left(&gas_object_id));
         self.enumerate_fake(gas_object_id);
         let new_key_pair;
         let (sender, sender_key) = match sender {
@@ -419,21 +450,20 @@ impl<'a> SuiTestAdapter<'a> {
         let storage_mut = Arc::get_mut(&mut self.storage).unwrap();
         storage_mut.insert_object(gas_object);
         let data = txn_data(sender, gas_payment);
-        let signature = Signature::new(&data, sender_key);
-        Transaction::new(data, signature)
+        to_sender_signed_transaction(data, sender_key)
     }
 
     fn execute_txn(
         &mut self,
-        transaction: Transaction,
+        transaction: VerifiedTransaction,
         gas_budget: u64,
     ) -> anyhow::Result<TxnSummary> {
         let gas_status = gas::start_gas_metering(gas_budget, 1, 1).unwrap();
         let transaction_digest = TransactionDigest::new(self.rng.gen());
         let objects_by_kind = transaction
+            .data()
             .data
-            .input_objects()
-            .unwrap()
+            .input_objects()?
             .into_iter()
             .flat_map(|kind| {
                 let id = kind.object_id();
@@ -445,24 +475,28 @@ impl<'a> SuiTestAdapter<'a> {
         let input_objects = InputObjects::new(objects_by_kind);
         let transaction_dependencies = input_objects.transaction_dependencies();
         let shared_object_refs: Vec<_> = input_objects.filter_shared_objects();
-        let mut temporary_store =
-            AuthorityTemporaryStore::new(self.storage.clone(), input_objects, transaction_digest);
-        let TransactionEffects {
-            status,
-            events,
-            created,
-            // TODO display all these somehow
-            transaction_digest: _,
-            mutated: _,
-            unwrapped: _,
-            deleted: _,
-            wrapped: _,
-            gas_object: _,
-            ..
-        } = execution_engine::execute_transaction_to_effects(
+        let temporary_store =
+            TemporaryStore::new(self.storage.clone(), input_objects, transaction_digest);
+        let (
+            inner,
+            TransactionEffects {
+                status,
+                events,
+                created,
+                mutated,
+                unwrapped,
+                // TODO display all these somehow
+                transaction_digest: _,
+                deleted,
+                wrapped,
+                gas_object: _,
+                ..
+            },
+            execution_error,
+        ) = execution_engine::execute_transaction_to_effects(
             shared_object_refs,
-            &mut temporary_store,
-            transaction.data,
+            temporary_store,
+            transaction.into_inner().into_data().data,
             transaction_digest,
             transaction_dependencies,
             &self.vm,
@@ -470,28 +504,28 @@ impl<'a> SuiTestAdapter<'a> {
             gas_status,
             // TODO: Support different epochs in transactional tests.
             0,
-        )?;
-        let (_objects, _active_inputs, written, deleted, _events) = temporary_store.into_inner();
+        );
         let created_set: BTreeSet<_> = created.iter().map(|((id, _, _), _)| *id).collect();
         let mut created_ids: Vec<_> = created_set.iter().copied().collect();
-        let mut written_ids: Vec<_> = written
-            .keys()
-            .copied()
-            .filter(|id| !created_set.contains(id))
+        let mut written_ids: Vec<_> = mutated
+            .iter()
+            .chain(&unwrapped)
+            .map(|((id, _, _), _)| *id)
             .collect();
-        let mut deleted_ids: Vec<_> = deleted.keys().copied().collect();
+        let mut deleted_ids: Vec<_> = deleted
+            .iter()
+            .chain(&wrapped)
+            .map(|(id, _, _)| *id)
+            .collect();
         // update storage
         Arc::get_mut(&mut self.storage)
             .unwrap()
-            .finish(written, deleted);
+            .finish(inner.written, inner.deleted);
         // enumerate objects after written to storage, sort by a "stable" sorting as the
         // object ID is not stable
-        let mut created_ids_vec = created
-            .iter()
-            .map(|((id, _, _), _)| *id)
-            .collect::<Vec<_>>();
+        let mut created_ids_vec = created_set.iter().collect::<Vec<_>>();
         created_ids_vec.sort_by_key(|id| self.get_object_sorting_key(id));
-        for id in &created_ids_vec {
+        for id in created_ids_vec {
             self.enumerate_fake(*id);
         }
         // sort by fake id
@@ -505,7 +539,15 @@ impl<'a> SuiTestAdapter<'a> {
                 deleted: deleted_ids,
                 events,
             }),
-            ExecutionStatus::Failure { error, .. } => Err(self.render_sui_error(*error)),
+            ExecutionStatus::Failure { error, .. } => {
+                Err(anyhow::anyhow!(self.stabilize_str(format!(
+                    "Transaction Effects Status: {}\nExecution Error: {}",
+                    error,
+                    execution_error.expect(
+                        "to have an execution error if a transaction's status is a failure"
+                    )
+                ))))
+            }
         }
     }
 
@@ -595,14 +637,12 @@ impl<'a> SuiTestAdapter<'a> {
 
     fn list_objs(&self, objs: &[ObjectID]) -> String {
         objs.iter()
-            .map(|id| format!("object({})", self.real_to_fake_object_id(id).unwrap()))
+            .map(|id| match self.real_to_fake_object_id(id) {
+                None => "object(_)".to_string(),
+                Some(fake) => format!("object({})", fake),
+            })
             .collect::<Vec<_>>()
             .join(", ")
-    }
-
-    fn render_sui_error(&self, sui_error: SuiError) -> anyhow::Error {
-        let error_string: String = format!("{}", sui_error);
-        anyhow!(self.stabilize_str(&error_string))
     }
 
     fn stabilize_str(&self, input: impl AsRef<str>) -> String {

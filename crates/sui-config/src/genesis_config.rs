@@ -1,37 +1,42 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::Result;
-use move_binary_format::CompiledModule;
 use multiaddr::Multiaddr;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use sui_types::base_types::{ObjectID, SuiAddress, TxContext};
-use sui_types::committee::StakeUnit;
-use sui_types::crypto::{get_key_pair_from_rng, KeyPair};
-use sui_types::object::Object;
+use serde_with::serde_as;
 use tracing::info;
 
+use sui_types::base_types::{ObjectID, SuiAddress};
+use sui_types::committee::StakeUnit;
+use sui_types::crypto::{
+    get_key_pair_from_rng, AccountKeyPair, AuthorityKeyPair, NetworkKeyPair, SuiKeyPair,
+};
+use sui_types::object::Object;
+use sui_types::sui_serde::KeyPairBase64;
+
+use crate::node::DEFAULT_GRPC_CONCURRENCY_LIMIT;
 use crate::Config;
+use crate::{utils, DEFAULT_COMMISSION_RATE, DEFAULT_GAS_PRICE, DEFAULT_STAKE};
 
 #[derive(Serialize, Deserialize)]
 pub struct GenesisConfig {
     pub validator_genesis_info: Option<Vec<ValidatorGenesisInfo>>,
     pub committee_size: usize,
+    pub grpc_load_shed: Option<bool>,
+    pub grpc_concurrency_limit: Option<usize>,
     pub accounts: Vec<AccountConfig>,
-    pub move_packages: Vec<PathBuf>,
-    pub sui_framework_lib_path: Option<PathBuf>,
-    pub move_framework_lib_path: Option<PathBuf>,
 }
 
 impl Config for GenesisConfig {}
 
 impl GenesisConfig {
-    pub fn generate_accounts<R: ::rand::RngCore + ::rand::CryptoRng>(
+    pub fn generate_accounts<R: rand::RngCore + rand::CryptoRng>(
         &self,
         mut rng: R,
-    ) -> Result<(Vec<KeyPair>, Vec<Object>)> {
+    ) -> Result<(Vec<AccountKeyPair>, Vec<Object>)> {
         let mut addresses = Vec::new();
         let mut preload_objects = Vec::new();
         let mut all_preload_objects_set = BTreeSet::new();
@@ -82,48 +87,78 @@ impl GenesisConfig {
 
         Ok((keys, preload_objects))
     }
-
-    pub fn generate_custom_move_modules(
-        &self,
-        genesis_ctx: &mut TxContext,
-    ) -> Result<Vec<Vec<CompiledModule>>> {
-        let mut custom_modules = Vec::new();
-        // Build custom move packages
-        if !self.move_packages.is_empty() {
-            info!(
-                "Loading {} Move packages from {:?}",
-                self.move_packages.len(),
-                self.move_packages,
-            );
-
-            for path in &self.move_packages {
-                let mut modules = sui_framework::build_move_package(
-                    path,
-                    move_package::BuildConfig::default(),
-                    false,
-                )?;
-
-                let package_id =
-                    sui_adapter::adapter::generate_package_id(&mut modules, genesis_ctx)?;
-
-                info!("Loaded package [{}] from {:?}.", package_id, path);
-                custom_modules.push(modules)
-            }
-        }
-        Ok(custom_modules)
-    }
 }
 
+#[serde_as]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ValidatorGenesisInfo {
-    pub key_pair: KeyPair,
+    #[serde_as(as = "KeyPairBase64")]
+    pub key_pair: AuthorityKeyPair,
+    #[serde_as(as = "KeyPairBase64")]
+    pub worker_key_pair: NetworkKeyPair,
+    pub account_key_pair: SuiKeyPair,
+    #[serde_as(as = "KeyPairBase64")]
+    pub network_key_pair: NetworkKeyPair,
     pub network_address: Multiaddr,
     pub stake: StakeUnit,
-    pub narwhal_primary_to_primary: Multiaddr,
-    pub narwhal_worker_to_primary: Multiaddr,
-    pub narwhal_primary_to_worker: Multiaddr,
-    pub narwhal_worker_to_worker: Multiaddr,
+    pub gas_price: u64,
+    pub commission_rate: u64,
+    pub narwhal_primary_address: Multiaddr,
+    pub narwhal_worker_address: Multiaddr,
     pub narwhal_consensus_address: Multiaddr,
+}
+
+impl ValidatorGenesisInfo {
+    pub fn from_localhost_for_testing(
+        key_pair: AuthorityKeyPair,
+        worker_key_pair: NetworkKeyPair,
+        account_key_pair: SuiKeyPair,
+        network_key_pair: NetworkKeyPair,
+    ) -> Self {
+        Self {
+            key_pair,
+            worker_key_pair,
+            account_key_pair,
+            network_key_pair,
+            network_address: utils::new_network_address(),
+            stake: DEFAULT_STAKE,
+            gas_price: DEFAULT_GAS_PRICE,
+            commission_rate: DEFAULT_COMMISSION_RATE,
+            narwhal_primary_address: utils::new_network_address(),
+            narwhal_worker_address: utils::new_network_address(),
+            narwhal_consensus_address: utils::new_network_address(),
+        }
+    }
+
+    pub fn from_base_ip(
+        key_pair: AuthorityKeyPair,
+        worker_key_pair: NetworkKeyPair,
+        account_key_pair: SuiKeyPair,
+        network_key_pair: NetworkKeyPair,
+        ip: String,
+        // Port offset allows running many SuiNodes inside the same simulator node, which is
+        // helpful for tests that don't use Swarm.
+        port_offset: usize,
+    ) -> Self {
+        assert!(port_offset < 1000);
+        let port_offset: u16 = port_offset.try_into().unwrap();
+        let make_addr =
+            |port: u16| -> Multiaddr { format!("/ip4/{}/tcp/{}/http", ip, port).parse().unwrap() };
+
+        ValidatorGenesisInfo {
+            key_pair,
+            worker_key_pair,
+            account_key_pair,
+            network_key_pair,
+            network_address: make_addr(1000 + port_offset),
+            stake: DEFAULT_STAKE,
+            gas_price: DEFAULT_GAS_PRICE,
+            commission_rate: DEFAULT_COMMISSION_RATE,
+            narwhal_primary_address: make_addr(2000 + port_offset),
+            narwhal_worker_address: make_addr(3000 + port_offset),
+            narwhal_consensus_address: make_addr(4000 + port_offset),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -160,7 +195,7 @@ fn default_gas_value() -> u64 {
     DEFAULT_GAS_AMOUNT
 }
 
-const DEFAULT_GAS_AMOUNT: u64 = 100000;
+const DEFAULT_GAS_AMOUNT: u64 = 100000000000000;
 const DEFAULT_NUMBER_OF_AUTHORITIES: usize = 4;
 const DEFAULT_NUMBER_OF_ACCOUNT: usize = 5;
 const DEFAULT_NUMBER_OF_OBJECT_PER_ACCOUNT: usize = 5;
@@ -170,6 +205,14 @@ impl GenesisConfig {
         Self::custom_genesis(
             DEFAULT_NUMBER_OF_AUTHORITIES,
             DEFAULT_NUMBER_OF_ACCOUNT,
+            DEFAULT_NUMBER_OF_OBJECT_PER_ACCOUNT,
+        )
+    }
+
+    pub fn for_local_testing_with_addresses(addresses: Vec<SuiAddress>) -> Self {
+        Self::custom_genesis_with_addresses(
+            DEFAULT_NUMBER_OF_AUTHORITIES,
+            addresses,
             DEFAULT_NUMBER_OF_OBJECT_PER_ACCOUNT,
         )
     }
@@ -205,6 +248,38 @@ impl GenesisConfig {
             ..Default::default()
         }
     }
+
+    pub fn custom_genesis_with_addresses(
+        num_authorities: usize,
+        addresses: Vec<SuiAddress>,
+        num_objects_per_account: usize,
+    ) -> Self {
+        assert!(
+            num_authorities > 0,
+            "num_authorities should be larger than 0"
+        );
+
+        let mut accounts = Vec::new();
+        for address in addresses {
+            let mut objects = Vec::new();
+            for _ in 0..num_objects_per_account {
+                objects.push(ObjectConfig {
+                    object_id: ObjectID::random(),
+                    gas_value: DEFAULT_GAS_AMOUNT,
+                })
+            }
+            accounts.push(AccountConfig {
+                address: Some(address),
+                gas_objects: objects,
+                gas_object_ranges: Some(Vec::new()),
+            })
+        }
+
+        Self {
+            accounts,
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for GenesisConfig {
@@ -212,10 +287,9 @@ impl Default for GenesisConfig {
         Self {
             validator_genesis_info: None,
             committee_size: DEFAULT_NUMBER_OF_AUTHORITIES,
+            grpc_load_shed: None,
+            grpc_concurrency_limit: Some(DEFAULT_GRPC_CONCURRENCY_LIMIT),
             accounts: vec![],
-            move_packages: vec![],
-            sui_framework_lib_path: None,
-            move_framework_lib_path: None,
         }
     }
 }

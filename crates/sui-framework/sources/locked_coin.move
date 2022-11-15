@@ -1,19 +1,19 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 module sui::locked_coin {
     use sui::balance::{Self, Balance};
     use sui::coin::{Self, Coin};
-    use sui::id::{Self, VersionedID};
+    use sui::object::{Self, UID};
     use sui::transfer;
     use sui::tx_context::{Self, TxContext};
     use sui::epoch_time_lock::{Self, EpochTimeLock};
 
-    friend sui::delegation;
+    friend sui::sui_system;
 
     /// A coin of type `T` locked until `locked_until_epoch`.
-    struct LockedCoin<phantom T> has key, store {
-        id: VersionedID,
+    struct LockedCoin<phantom T> has key {
+        id: UID,
         balance: Balance<T>,
         locked_until_epoch: EpochTimeLock
     }
@@ -21,7 +21,7 @@ module sui::locked_coin {
     /// Create a LockedCoin from `balance` and transfer it to `owner`.
     public fun new_from_balance<T>(balance: Balance<T>, locked_until_epoch: EpochTimeLock, owner: address, ctx: &mut TxContext) {
         let locked_coin = LockedCoin {
-            id: tx_context::new_id(ctx),
+            id: object::new(ctx),
             balance,
             locked_until_epoch
         };
@@ -31,7 +31,7 @@ module sui::locked_coin {
     /// Destruct a LockedCoin wrapper and keep the balance.
     public(friend) fun into_balance<T>(coin: LockedCoin<T>): (Balance<T>, EpochTimeLock) {
         let LockedCoin { id, locked_until_epoch, balance } = coin;
-        id::delete(id);
+        object::delete(id);
         (balance, locked_until_epoch)
     }
 
@@ -55,7 +55,7 @@ module sui::locked_coin {
     /// to the sender.
     public entry fun unlock_coin<T>(locked_coin: LockedCoin<T>, ctx: &mut TxContext) {
         let LockedCoin { id, balance, locked_until_epoch } = locked_coin;
-        id::delete(id);
+        object::delete(id);
         epoch_time_lock::destroy(locked_until_epoch, ctx);
         let coin = coin::from_balance(balance, ctx);
         transfer::transfer(coin, tx_context::sender(ctx));

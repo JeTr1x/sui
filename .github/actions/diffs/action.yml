@@ -5,14 +5,8 @@ outputs:
     description: True when changes happened to some documentation
     value: "${{ steps.diff.outputs.isDoc }}"
   isRust:
-    description: True when changes happened to the rust code
+    description: True when changes happened to the Rust code
     value: "${{ steps.diff.outputs.isRust }}"
-  isExplorerClient:
-    description: True when there are changes to files related to explorer client
-    value: "${{ steps.diff.outputs.isExplorerClient }}"
-  isTypescriptSDK:
-    description: True when there are changes to files related to TypeScript SDK
-    value: "${{ steps.diff.outputs.isTypescriptSDK }}"
 runs:
   using: composite
   steps:
@@ -23,17 +17,12 @@ runs:
     with:
       filters: |
         isRust:
-          - '!(explorer|doc|.github|sdk|wallet)/**'
+          - 'crates/**'
+          - 'narwhal/**'
+          - 'sui_programmability/**'
           - '.github/workflows/bench.yml'
           - '.github/workflows/codecov.yml'
           - '.github/workflows/rust.yml'
-        isExplorerClient:
-          - 'explorer/client/**'
-          - '.github/workflows/explorer-client-prs.yml'
-        isTypescriptSDK:
-          - 'sdk/typescript/**'
-          - 'crates/sui-open-rpc/samples/**'
-          - '.github/workflows/ts-sdk.yml'
         isDoc:
           - 'doc/**'
           - '*.md'

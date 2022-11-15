@@ -1,4 +1,4 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -8,6 +8,7 @@ use crate::{
 use move_binary_format::access::ModuleAccess;
 use move_binary_format::binary_views::BinaryIndexedView;
 use move_binary_format::file_format::CompiledModule;
+use move_binary_format::normalized;
 use move_core_types::identifier::Identifier;
 use move_disassembler::disassembler::Disassembler;
 use move_ir_types::location::Spanned;
@@ -63,6 +64,10 @@ impl MovePackage {
     pub fn disassemble(&self) -> SuiResult<BTreeMap<String, Value>> {
         disassemble_modules(self.module_map.values())
     }
+
+    pub fn normalize(&self) -> SuiResult<BTreeMap<String, normalized::Module>> {
+        normalize_modules(self.module_map.values())
+    }
 }
 
 pub fn disassemble_modules<'a, I>(modules: I) -> SuiResult<BTreeMap<String, Value>>
@@ -71,8 +76,11 @@ where
 {
     let mut disassembled = BTreeMap::new();
     for bytecode in modules {
-        let module = CompiledModule::deserialize(bytecode)
-            .expect("Adapter publish flow ensures that this bytecode deserializes");
+        let module = CompiledModule::deserialize(bytecode).map_err(|error| {
+            SuiError::ModuleDeserializationFailure {
+                error: error.to_string(),
+            }
+        })?;
         let view = BinaryIndexedView::Module(&module);
         let d = Disassembler::from_view(view, Spanned::unsafe_no_loc(()).loc).map_err(|e| {
             SuiError::ObjectSerializationError {
@@ -87,6 +95,23 @@ where
         disassembled.insert(module.name().to_string(), Value::String(bytecode_str));
     }
     Ok(disassembled)
+}
+
+pub fn normalize_modules<'a, I>(modules: I) -> SuiResult<BTreeMap<String, normalized::Module>>
+where
+    I: Iterator<Item = &'a Vec<u8>>,
+{
+    let mut normalized_modules = BTreeMap::new();
+    for bytecode in modules {
+        let module = CompiledModule::deserialize(bytecode).map_err(|error| {
+            SuiError::ModuleDeserializationFailure {
+                error: error.to_string(),
+            }
+        })?;
+        let normalized_module = normalized::Module::new(&module);
+        normalized_modules.insert(normalized_module.name.to_string(), normalized_module);
+    }
+    Ok(normalized_modules)
 }
 
 impl FromIterator<CompiledModule> for MovePackage {

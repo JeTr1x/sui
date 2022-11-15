@@ -1,18 +1,15 @@
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::str::FromStr;
 
 use anyhow::anyhow;
-use base64ct::Encoding;
 use curve25519_dalek::ristretto::RistrettoPoint;
-use digest::Digest;
-use ed25519_dalek::Sha512;
 use hex::FromHex;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::ident_str;
@@ -23,16 +20,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use serde_with::Bytes;
-use sha3::Sha3_256;
+use sha2::Sha512;
 
-use crate::committee::EpochId;
-use crate::crypto::PublicKeyBytes;
+pub use crate::committee::EpochId;
+use crate::crypto::{
+    AuthorityPublicKey, AuthorityPublicKeyBytes, KeypairTraits, PublicKey, SuiPublicKey,
+};
+use crate::error::ExecutionError;
+use crate::error::ExecutionErrorKind;
 use crate::error::SuiError;
 use crate::object::{Object, Owner};
-use crate::sui_serde::Base64;
-use crate::sui_serde::Hex;
 use crate::sui_serde::Readable;
 use crate::waypoint::IntoPoint;
+use fastcrypto::encoding::{Base64, Encoding, Hex};
+use fastcrypto::hash::{HashFunction, Sha3_256};
 
 #[cfg(test)]
 #[path = "unit_tests/base_types_tests.rs"]
@@ -55,7 +56,7 @@ mod base_types_tests;
 pub struct SequenceNumber(u64);
 
 impl fmt::Display for SequenceNumber {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:#x}", self.0)
     }
 }
@@ -65,7 +66,7 @@ pub type VersionNumber = SequenceNumber;
 #[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash, Default, Debug, Serialize, Deserialize)]
 pub struct UserData(pub Option<[u8; 32]>);
 
-pub type AuthorityName = PublicKeyBytes;
+pub type AuthorityName = AuthorityPublicKeyBytes;
 
 #[serde_as]
 #[derive(Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
@@ -76,6 +77,14 @@ pub struct ObjectID(
 );
 
 pub type ObjectRef = (ObjectID, SequenceNumber, ObjectDigest);
+
+pub fn random_object_ref() -> ObjectRef {
+    (
+        ObjectID::random(),
+        SequenceNumber::new(),
+        ObjectDigest::new([0; 32]),
+    )
+}
 
 #[derive(Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Debug)]
 pub struct ObjectInfo {
@@ -112,6 +121,12 @@ impl From<ObjectInfo> for ObjectRef {
     }
 }
 
+impl From<&ObjectInfo> for ObjectRef {
+    fn from(info: &ObjectInfo) -> Self {
+        (info.object_id, info.version, info.digest)
+    }
+}
+
 pub const SUI_ADDRESS_LENGTH: usize = ObjectID::LENGTH;
 
 #[serde_as]
@@ -142,11 +157,7 @@ impl SuiAddress {
     where
         S: serde::ser::Serializer,
     {
-        serializer.serialize_str(
-            &*key
-                .map(|addr| encode_bytes_hex(&addr))
-                .unwrap_or_else(|| "".to_string()),
-        )
+        serializer.serialize_str(&key.map(encode_bytes_hex).unwrap_or_default())
     }
 
     pub fn optional_address_from_hex<'de, D>(
@@ -171,6 +182,12 @@ impl From<ObjectID> for SuiAddress {
     }
 }
 
+impl From<AccountAddress> for SuiAddress {
+    fn from(address: AccountAddress) -> SuiAddress {
+        Self(address.into_bytes())
+    }
+}
+
 impl TryFrom<Vec<u8>> for SuiAddress {
     type Error = SuiError;
 
@@ -181,21 +198,42 @@ impl TryFrom<Vec<u8>> for SuiAddress {
     }
 }
 
-impl From<&PublicKeyBytes> for SuiAddress {
-    fn from(key: &PublicKeyBytes) -> SuiAddress {
-        Self::from(*key)
-    }
-}
-
-impl From<PublicKeyBytes> for SuiAddress {
-    fn from(key: PublicKeyBytes) -> SuiAddress {
+impl From<&AuthorityPublicKeyBytes> for SuiAddress {
+    fn from(pkb: &AuthorityPublicKeyBytes) -> Self {
         let mut hasher = Sha3_256::default();
-        hasher.update(key.as_ref());
+        hasher.update([AuthorityPublicKey::SIGNATURE_SCHEME.flag()]);
+        hasher.update(pkb);
         let g_arr = hasher.finalize();
 
         let mut res = [0u8; SUI_ADDRESS_LENGTH];
         res.copy_from_slice(&AsRef::<[u8]>::as_ref(&g_arr)[..SUI_ADDRESS_LENGTH]);
-        Self(res)
+        SuiAddress(res)
+    }
+}
+
+impl<T: SuiPublicKey> From<&T> for SuiAddress {
+    fn from(pk: &T) -> Self {
+        let mut hasher = Sha3_256::default();
+        hasher.update([T::SIGNATURE_SCHEME.flag()]);
+        hasher.update(pk);
+        let g_arr = hasher.finalize();
+
+        let mut res = [0u8; SUI_ADDRESS_LENGTH];
+        res.copy_from_slice(&AsRef::<[u8]>::as_ref(&g_arr)[..SUI_ADDRESS_LENGTH]);
+        SuiAddress(res)
+    }
+}
+
+impl From<&PublicKey> for SuiAddress {
+    fn from(pk: &PublicKey) -> Self {
+        let mut hasher = Sha3_256::default();
+        hasher.update([pk.flag()]);
+        hasher.update(pk);
+        let g_arr = hasher.finalize();
+
+        let mut res = [0u8; SUI_ADDRESS_LENGTH];
+        res.copy_from_slice(&AsRef::<[u8]>::as_ref(&g_arr)[..SUI_ADDRESS_LENGTH]);
+        SuiAddress(res)
     }
 }
 
@@ -240,7 +278,7 @@ impl IntoPoint for TransactionDigest {
 pub struct ObjectDigest(
     #[schemars(with = "Base64")]
     #[serde_as(as = "Readable<Base64, Bytes>")]
-    pub [u8; 32],
+    pub [u8; OBJECT_DIGEST_LENGTH],
 ); // We use SHA3-256 hence 32 bytes here
 
 #[serde_as]
@@ -252,9 +290,11 @@ pub struct TransactionEffectsDigest(
 );
 
 impl TransactionEffectsDigest {
+    pub const ZERO: Self = TransactionEffectsDigest([0u8; TRANSACTION_DIGEST_LENGTH]);
+
     // for testing
     pub fn random() -> Self {
-        let random_bytes = rand::thread_rng().gen::<[u8; 32]>();
+        let random_bytes = rand::thread_rng().gen::<[u8; TRANSACTION_DIGEST_LENGTH]>();
         Self(random_bytes)
     }
 }
@@ -294,6 +334,12 @@ impl IntoPoint for ExecutionDigests {
 
 pub const STD_OPTION_MODULE_NAME: &IdentStr = ident_str!("option");
 pub const STD_OPTION_STRUCT_NAME: &IdentStr = ident_str!("Option");
+
+pub const STD_ASCII_MODULE_NAME: &IdentStr = ident_str!("ascii");
+pub const STD_ASCII_STRUCT_NAME: &IdentStr = ident_str!("String");
+
+pub const STD_UTF8_MODULE_NAME: &IdentStr = ident_str!("string");
+pub const STD_UTF8_STRUCT_NAME: &IdentStr = ident_str!("String");
 
 pub const TX_CONTEXT_MODULE_NAME: &IdentStr = ident_str!("tx_context");
 pub const TX_CONTEXT_STRUCT_NAME: &IdentStr = ident_str!("TxContext");
@@ -337,6 +383,10 @@ impl TxContext {
         TransactionDigest::new(self.digest.clone().try_into().unwrap())
     }
 
+    pub fn sender(&self) -> SuiAddress {
+        SuiAddress::from(ObjectID(self.sender))
+    }
+
     pub fn to_vec(&self) -> Vec<u8> {
         bcs::to_bytes(&self).unwrap()
     }
@@ -345,12 +395,12 @@ impl TxContext {
     /// when mutable context is passed over some boundary via
     /// serialize/deserialize and this is the reason why this method
     /// consumes the other context..
-    pub fn update_state(&mut self, other: TxContext) -> Result<(), SuiError> {
+    pub fn update_state(&mut self, other: TxContext) -> Result<(), ExecutionError> {
         if self.sender != other.sender
             || self.digest != other.digest
             || other.ids_created < self.ids_created
         {
-            return Err(SuiError::InvalidTxUpdate);
+            return Err(ExecutionErrorKind::InvalidTransactionUpdate.into());
         }
         self.ids_created = other.ids_created;
         Ok(())
@@ -365,16 +415,14 @@ impl TxContext {
         )
     }
 
-    /// A function that lists all IDs created by this TXContext
-    pub fn recreate_all_ids(&self) -> HashSet<ObjectID> {
-        (0..self.ids_created)
-            .map(|seq| self.digest().derive_id(seq))
-            .collect()
+    // for testing
+    pub fn with_sender_for_testing_only(sender: &SuiAddress) -> Self {
+        Self::new(sender, &TransactionDigest::random(), 0)
     }
 }
 
 impl TransactionDigest {
-    pub fn new(bytes: [u8; 32]) -> Self {
+    pub fn new(bytes: [u8; TRANSACTION_DIGEST_LENGTH]) -> Self {
         Self(bytes)
     }
 
@@ -383,7 +431,7 @@ impl TransactionDigest {
     ///
     /// TODO(https://github.com/MystenLabs/sui/issues/65): we can pick anything here
     pub fn genesis() -> Self {
-        Self::new([0; 32])
+        Self::new([0; TRANSACTION_DIGEST_LENGTH])
     }
 
     /// Create an ObjectID from `self` and `creation_num`.
@@ -397,12 +445,12 @@ impl TransactionDigest {
         let hash = hasher.finalize();
 
         // truncate into an ObjectID.
-        ObjectID::try_from(&hash[0..ObjectID::LENGTH]).unwrap()
+        ObjectID::try_from(&hash.as_ref()[0..ObjectID::LENGTH]).unwrap()
     }
 
     // for testing
     pub fn random() -> Self {
-        let random_bytes = rand::thread_rng().gen::<[u8; 32]>();
+        let random_bytes = rand::thread_rng().gen::<[u8; TRANSACTION_DIGEST_LENGTH]>();
         Self::new(random_bytes)
     }
 
@@ -445,16 +493,20 @@ impl Borrow<[u8]> for &TransactionDigest {
 }
 
 impl ObjectDigest {
-    pub const MIN: ObjectDigest = ObjectDigest([u8::MIN; 32]);
-    pub const MAX: ObjectDigest = ObjectDigest([u8::MAX; 32]);
+    pub const MIN: ObjectDigest = ObjectDigest([u8::MIN; OBJECT_DIGEST_LENGTH]);
+    pub const MAX: ObjectDigest = ObjectDigest([u8::MAX; OBJECT_DIGEST_LENGTH]);
+    pub const OBJECT_DIGEST_DELETED_BYTE_VAL: u8 = 99;
+    pub const OBJECT_DIGEST_WRAPPED_BYTE_VAL: u8 = 88;
 
     /// A marker that signifies the object is deleted.
-    pub const OBJECT_DIGEST_DELETED: ObjectDigest = ObjectDigest([99; 32]);
+    pub const OBJECT_DIGEST_DELETED: ObjectDigest =
+        ObjectDigest([Self::OBJECT_DIGEST_DELETED_BYTE_VAL; OBJECT_DIGEST_LENGTH]);
 
     /// A marker that signifies the object is wrapped into another object.
-    pub const OBJECT_DIGEST_WRAPPED: ObjectDigest = ObjectDigest([88; 32]);
+    pub const OBJECT_DIGEST_WRAPPED: ObjectDigest =
+        ObjectDigest([Self::OBJECT_DIGEST_WRAPPED_BYTE_VAL; OBJECT_DIGEST_LENGTH]);
 
-    pub fn new(bytes: [u8; 32]) -> Self {
+    pub fn new(bytes: [u8; OBJECT_DIGEST_LENGTH]) -> Self {
         Self(bytes)
     }
 
@@ -464,16 +516,19 @@ impl ObjectDigest {
 
     // for testing
     pub fn random() -> Self {
-        let random_bytes = rand::thread_rng().gen::<[u8; 32]>();
+        let random_bytes = rand::thread_rng().gen::<[u8; OBJECT_DIGEST_LENGTH]>();
         Self::new(random_bytes)
     }
 }
 
-pub fn get_new_address() -> SuiAddress {
-    crate::crypto::get_key_pair().0
+pub fn get_new_address<K: KeypairTraits>() -> SuiAddress
+where
+    <K as KeypairTraits>::PubKey: SuiPublicKey,
+{
+    crate::crypto::get_key_pair::<K>().0
 }
 
-pub fn bytes_as_hex<B, S>(bytes: &B, serializer: S) -> Result<S::Ok, S::Error>
+pub fn bytes_as_hex<B, S>(bytes: B, serializer: S) -> Result<S::Ok, S::Error>
 where
     B: AsRef<[u8]>,
     S: serde::ser::Serializer,
@@ -491,7 +546,7 @@ where
     Ok(value)
 }
 
-pub fn encode_bytes_hex<B: AsRef<[u8]>>(bytes: &B) -> String {
+pub fn encode_bytes_hex<B: AsRef<[u8]>>(bytes: B) -> String {
     hex::encode(bytes.as_ref())
 }
 
@@ -542,7 +597,7 @@ pub fn dbg_object_id(name: u8) -> ObjectID {
 
 impl std::fmt::Debug for ObjectDigest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        let s = hex::encode(&self.0);
+        let s = hex::encode(self.0);
         write!(f, "o#{}", s)?;
         Ok(())
     }
@@ -567,7 +622,7 @@ impl TryFrom<&[u8]> for ObjectDigest {
 
 impl std::fmt::Debug for TransactionDigest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        let s = base64ct::Base64::encode_string(&self.0);
+        let s = Base64::encode(self.0);
         write!(f, "{}", s)?;
         Ok(())
     }
@@ -575,7 +630,7 @@ impl std::fmt::Debug for TransactionDigest {
 
 impl std::fmt::Debug for TransactionEffectsDigest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        let s = base64ct::Base64::encode_string(&self.0);
+        let s = Base64::encode(self.0);
         write!(f, "{}", s)?;
         Ok(())
     }
@@ -918,11 +973,21 @@ impl FromStr for SuiAddress {
     }
 }
 
-impl std::str::FromStr for ObjectID {
+impl FromStr for ObjectID {
     type Err = ObjectIDParseError;
 
     fn from_str(s: &str) -> Result<Self, ObjectIDParseError> {
         // Try to match both the literal (0xABC..) and the normal (ABC)
         Self::from_hex(s).or_else(|_| Self::from_hex_literal(s))
+    }
+}
+
+impl FromStr for TransactionDigest {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut result = [0u8; TRANSACTION_DIGEST_LENGTH];
+        result.copy_from_slice(&Base64::decode(s).map_err(|e| anyhow!(e))?);
+        Ok(TransactionDigest(result))
     }
 }

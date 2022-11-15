@@ -1,34 +1,32 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::authority::SuiDataStore;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use sui_types::messages::{CertifiedTransaction, TransactionEffects};
+use std::fmt::Debug;
+use sui_types::messages::{TransactionEffects, VerifiedCertificate};
 use sui_types::{base_types::*, batch::TxSequenceNumber, error::SuiError, fp_ensure};
 use tracing::debug;
 
-const MAX_TX_RANGE_SIZE: u64 = 4096;
+pub const MAX_TX_RANGE_SIZE: u64 = 4096;
 
-pub struct QueryHelpers<const ALL_OBJ_VER: bool, S> {
+pub struct QueryHelpers<S> {
     _s: std::marker::PhantomData<S>,
 }
 
+// TODO: [gateway-deprecation]
 // TODO: QueryHelpers contains query implementations for the Gateway read API that would otherwise
 // be duplicated between AuthorityState and GatewayState. The gateway read API will be removed
 // soon, since nodes will be handling that. At that point we should delete this struct and move the
 // code back to AuthorityState.
-impl<const ALL_OBJ_VER: bool, S: Eq + Serialize + for<'de> Deserialize<'de>>
-    QueryHelpers<ALL_OBJ_VER, S>
-{
-    pub fn get_total_transaction_number(
-        database: &SuiDataStore<ALL_OBJ_VER, S>,
-    ) -> Result<u64, anyhow::Error> {
+impl<S: Eq + Debug + Serialize + for<'de> Deserialize<'de>> QueryHelpers<S> {
+    pub fn get_total_transaction_number(database: &SuiDataStore<S>) -> Result<u64, anyhow::Error> {
         Ok(database.next_sequence_number()?)
     }
 
     pub fn get_transactions_in_range(
-        database: &SuiDataStore<ALL_OBJ_VER, S>,
+        database: &SuiDataStore<S>,
         start: TxSequenceNumber,
         end: TxSequenceNumber,
     ) -> Result<Vec<(TxSequenceNumber, TransactionDigest)>, anyhow::Error> {
@@ -53,13 +51,17 @@ impl<const ALL_OBJ_VER: bool, S: Eq + Serialize + for<'de> Deserialize<'de>>
             }
             .into()
         );
-        let res = database.transactions_in_seq_range(start, end)?;
+        let res = database
+            .transactions_in_seq_range(start, end)?
+            .into_iter()
+            .map(|(seq, digests)| (seq, digests.transaction))
+            .collect();
         debug!(?start, ?end, ?res, "Fetched transactions");
         Ok(res)
     }
 
     pub fn get_recent_transactions(
-        database: &SuiDataStore<ALL_OBJ_VER, S>,
+        database: &SuiDataStore<S>,
         count: u64,
     ) -> Result<Vec<(TxSequenceNumber, TransactionDigest)>, anyhow::Error> {
         fp_ensure!(
@@ -78,13 +80,13 @@ impl<const ALL_OBJ_VER: bool, S: Eq + Serialize + for<'de> Deserialize<'de>>
     }
 
     pub fn get_transaction(
-        database: &SuiDataStore<ALL_OBJ_VER, S>,
-        digest: TransactionDigest,
-    ) -> Result<(CertifiedTransaction, TransactionEffects), anyhow::Error> {
-        let opt = database.get_certified_transaction(&digest)?;
+        database: &SuiDataStore<S>,
+        digest: &TransactionDigest,
+    ) -> Result<(VerifiedCertificate, TransactionEffects), anyhow::Error> {
+        let opt = database.get_certified_transaction(digest)?;
         match opt {
-            Some(certificate) => Ok((certificate, database.get_effects(&digest)?)),
-            None => Err(anyhow!(SuiError::TransactionNotFound { digest })),
+            Some(certificate) => Ok((certificate, database.get_effects(digest)?)),
+            None => Err(anyhow!(SuiError::TransactionNotFound { digest: *digest })),
         }
     }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::{TcpListener, TcpStream};
@@ -18,7 +18,7 @@ pub fn get_available_port() -> u16 {
     panic!("Error: could not find an available port");
 }
 
-fn get_ephemeral_port() -> ::std::io::Result<u16> {
+fn get_ephemeral_port() -> std::io::Result<u16> {
     // Request a random available port from the OS
     let listener = TcpListener::bind(("localhost", 0))?;
     let addr = listener.local_addr()?;
@@ -33,7 +33,7 @@ fn get_ephemeral_port() -> ::std::io::Result<u16> {
 }
 
 pub fn new_network_address() -> multiaddr::Multiaddr {
-    format!("/dns/localhost/tcp/{}/http", get_available_port())
+    format!("/ip4/127.0.0.1/tcp/{}/http", get_available_port())
         .parse()
         .unwrap()
 }

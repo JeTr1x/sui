@@ -1,4 +1,4 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::verification_failure;
@@ -6,15 +6,15 @@ use move_binary_format::{
     binary_views::BinaryIndexedView,
     file_format::{Bytecode, CompiledModule},
 };
-use sui_types::error::SuiResult;
+use sui_types::error::ExecutionError;
 
-pub fn verify_module(module: &CompiledModule) -> SuiResult {
+pub fn verify_module(module: &CompiledModule) -> Result<(), ExecutionError> {
     verify_global_storage_access(module)
 }
 
 /// Global storage in sui is handled by sui instead of within Move.
 /// Hence we want to forbid any global storage access in Move.
-fn verify_global_storage_access(module: &CompiledModule) -> SuiResult {
+fn verify_global_storage_access(module: &CompiledModule) -> Result<(), ExecutionError> {
     let view = BinaryIndexedView::Module(module);
     for func_def in &module.function_defs {
         if func_def.code.is_none() {
@@ -42,11 +42,17 @@ fn verify_global_storage_access(module: &CompiledModule) -> SuiResult {
                 | Bytecode::BrFalse(_)
                 | Bytecode::Branch(_)
                 | Bytecode::LdU8(_)
+                | Bytecode::LdU16(_)
+                | Bytecode::LdU32(_)
                 | Bytecode::LdU64(_)
                 | Bytecode::LdU128(_)
+                | Bytecode::LdU256(_)
                 | Bytecode::CastU8
+                | Bytecode::CastU16
+                | Bytecode::CastU32
                 | Bytecode::CastU64
                 | Bytecode::CastU128
+                | Bytecode::CastU256
                 | Bytecode::LdConst(_)
                 | Bytecode::LdTrue
                 | Bytecode::LdFalse

@@ -1,4 +1,4 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Objects whose struct type has key ability represent Sui objects.
@@ -11,25 +11,21 @@
 //! 1. Returned
 //! 2. Written into a mutable reference
 //! 3. Added to a vector
-//! 4. Passed to a function call
-
-use crate::verification_failure;
+//! 4. Passed to a function cal::;
 use move_binary_format::{
     binary_views::{BinaryIndexedView, FunctionView},
+    errors::{Location, PartialVMError, PartialVMResult},
     file_format::{
         Bytecode, CodeOffset, CompiledModule, FunctionDefinitionIndex, FunctionHandle, LocalIndex,
         StructDefinition, StructFieldInformation,
     },
 };
 use move_bytecode_verifier::absint::{
-    AbstractDomain, AbstractInterpreter, BlockInvariant, BlockPostcondition, JoinResult,
-    TransferFunctions,
+    AbstractDomain, AbstractInterpreter, JoinResult, TransferFunctions,
 };
+use move_core_types::vm_status::StatusCode;
 use std::collections::BTreeMap;
-use sui_types::{
-    error::{SuiError, SuiResult},
-    SUI_FRAMEWORK_ADDRESS,
-};
+use sui_types::{error::ExecutionError, id::OBJECT_MODULE_NAME, SUI_FRAMEWORK_ADDRESS};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AbstractValue {
@@ -47,11 +43,11 @@ impl AbstractValue {
     }
 }
 
-pub fn verify_module(module: &CompiledModule) -> SuiResult {
+pub fn verify_module(module: &CompiledModule) -> Result<(), ExecutionError> {
     verify_id_leak(module)
 }
 
-fn verify_id_leak(module: &CompiledModule) -> SuiResult {
+fn verify_id_leak(module: &CompiledModule) -> Result<(), ExecutionError> {
     let binary_view = BinaryIndexedView::Module(module);
     for (index, func_def) in module.function_defs.iter().enumerate() {
         let code = match func_def.code.as_ref() {
@@ -63,28 +59,9 @@ fn verify_id_leak(module: &CompiledModule) -> SuiResult {
             FunctionView::function(module, FunctionDefinitionIndex(index as u16), code, handle);
         let initial_state = AbstractState::new(&func_view);
         let mut verifier = IDLeakAnalysis::new(&binary_view, &func_view);
-        let inv_map = verifier.analyze_function(initial_state, &func_view);
-        // Report all the join failures
-        for (_block_id, BlockInvariant { post, .. }) in inv_map {
-            match post {
-                BlockPostcondition::Error(err) => match err {
-                    SuiError::ModuleVerificationFailure { error } => {
-                        return Err(SuiError::ModuleVerificationFailure {
-                            error: format!(
-                                "ID leak detected in function {}: {}",
-                                binary_view.identifier_at(handle.name),
-                                error
-                            ),
-                        });
-                    }
-                    _ => {
-                        panic!("Unexpected error type");
-                    }
-                },
-                // Block might be unprocessed if all predecessors had an error
-                BlockPostcondition::Unprocessed | BlockPostcondition::Success => (),
-            }
-        }
+        verifier
+            .analyze_function(initial_state, &func_view)
+            .map_err(|e| e.finish(Location::Module(module.self_id())))?;
     }
 
     Ok(())
@@ -147,7 +124,6 @@ impl<'a> IDLeakAnalysis<'a> {
 
 impl<'a> TransferFunctions for IDLeakAnalysis<'a> {
     type State = AbstractState;
-    type AnalysisError = SuiError;
 
     fn execute(
         &mut self,
@@ -155,15 +131,14 @@ impl<'a> TransferFunctions for IDLeakAnalysis<'a> {
         bytecode: &Bytecode,
         index: CodeOffset,
         _: CodeOffset,
-    ) -> Result<(), Self::AnalysisError> {
-        execute_inner(self, state, bytecode, index)?;
-        Ok(())
+    ) -> PartialVMResult<()> {
+        execute_inner(self, state, bytecode, index)
     }
 }
 
 impl<'a> AbstractInterpreter for IDLeakAnalysis<'a> {}
 
-/// Certain Sui Framework functions can safely take a `VersionedID` by value
+/// Certain Sui Framework functions can safely take a `ID` by value
 fn is_call_safe_to_leak(verifier: &IDLeakAnalysis, function_handle: &FunctionHandle) -> bool {
     let m = verifier
         .binary_view
@@ -174,8 +149,8 @@ fn is_call_safe_to_leak(verifier: &IDLeakAnalysis, function_handle: &FunctionHan
         return false;
     }
 
-    // sui::id::delete
-    (verifier.binary_view.identifier_at(m.name).as_str() == "id"
+    // sui::object::delete
+    (verifier.binary_view.identifier_at(m.name) == OBJECT_MODULE_NAME
         && verifier
             .binary_view
             .identifier_at(function_handle.name)
@@ -190,16 +165,14 @@ fn is_call_safe_to_leak(verifier: &IDLeakAnalysis, function_handle: &FunctionHan
                 == "delete_child_object")
 }
 
-fn call(verifier: &mut IDLeakAnalysis, function_handle: &FunctionHandle) -> SuiResult {
+fn call(verifier: &mut IDLeakAnalysis, function_handle: &FunctionHandle) -> PartialVMResult<()> {
     let guaranteed_safe = is_call_safe_to_leak(verifier, function_handle);
     let parameters = verifier
         .binary_view
         .signature_at(function_handle.parameters);
     for _ in 0..parameters.len() {
         if verifier.stack.pop().unwrap() == AbstractValue::ID && !guaranteed_safe {
-            return Err(verification_failure(
-                "ID leaked through function call.".to_string(),
-            ));
+            move_verification_error("ID leaked through function call.");
         }
     }
 
@@ -253,7 +226,7 @@ fn execute_inner(
     state: &mut AbstractState,
     bytecode: &Bytecode,
     _: CodeOffset,
-) -> SuiResult {
+) -> PartialVMResult<()> {
     // TODO: Better dianostics with location
     match bytecode {
         Bytecode::Pop => {
@@ -278,8 +251,11 @@ fn execute_inner(
         | Bytecode::ReadRef
         // Following are unary operators that don't apply to ID.
         | Bytecode::CastU8
+        | Bytecode::CastU16
+        | Bytecode::CastU32
         | Bytecode::CastU64
         | Bytecode::CastU128
+        | Bytecode::CastU256
         | Bytecode::Not
         | Bytecode::VecLen(_)
         | Bytecode::VecPopBack(_) => {
@@ -320,7 +296,7 @@ fn execute_inner(
             // Top of stack is the reference, and the second element is the value.
             verifier.stack.pop().unwrap();
             if verifier.stack.pop().unwrap() == AbstractValue::ID {
-                return Err(verification_failure("ID is leaked to a reference.".to_string()));
+                return Err(move_verification_error("ID is leaked to a reference."));
             }
         }
 
@@ -362,7 +338,7 @@ fn execute_inner(
         Bytecode::Ret => {
             for _ in 0..verifier.function_view.return_().len() {
                 if verifier.stack.pop().unwrap() == AbstractValue::ID {
-                    return Err(verification_failure("ID leaked through function return.".to_string()));
+                    return Err(move_verification_error("ID leaked through function return."));
                 }
             }
         }
@@ -372,33 +348,33 @@ fn execute_inner(
         }
 
         // These bytecodes produce constants, and hence cannot be ID.
-        Bytecode::LdTrue | Bytecode::LdFalse | Bytecode::LdU8(_) | Bytecode::LdU64(_) | Bytecode::LdU128(_) | Bytecode::LdConst(_) => {
+        Bytecode::LdTrue | Bytecode::LdFalse | Bytecode::LdU8(_) | Bytecode::LdU16(_)| Bytecode::LdU32(_)  | Bytecode::LdU64(_) | Bytecode::LdU128(_)| Bytecode::LdU256(_)  | Bytecode::LdConst(_) => {
             verifier.stack.push(AbstractValue::NonID);
         }
 
         Bytecode::Pack(idx) => {
-            let struct_def = verifier.binary_view.struct_def_at(*idx)?;
+            let struct_def = expect_ok(verifier.binary_view.struct_def_at(*idx))?;
             pack(verifier, struct_def);
         }
         Bytecode::PackGeneric(idx) => {
-            let struct_inst = verifier.binary_view.struct_instantiation_at(*idx)?;
-            let struct_def = verifier.binary_view.struct_def_at(struct_inst.def)?;
+            let struct_inst = expect_ok(verifier.binary_view.struct_instantiation_at(*idx))?;
+            let struct_def = expect_ok(verifier.binary_view.struct_def_at(struct_inst.def))?;
             pack(verifier, struct_def);
         }
         Bytecode::Unpack(idx) => {
-            let struct_def = verifier.binary_view.struct_def_at(*idx)?;
+            let struct_def = expect_ok(verifier.binary_view.struct_def_at(*idx))?;
             unpack(verifier, struct_def);
         }
         Bytecode::UnpackGeneric(idx) => {
-            let struct_inst = verifier.binary_view.struct_instantiation_at(*idx)?;
-            let struct_def = verifier.binary_view.struct_def_at(struct_inst.def)?;
+            let struct_inst = expect_ok(verifier.binary_view.struct_instantiation_at(*idx))?;
+            let struct_def = expect_ok(verifier.binary_view.struct_def_at(struct_inst.def))?;
             unpack(verifier, struct_def);
         }
 
         Bytecode::VecPack(_, num) => {
             for _ in 0..*num {
                 if verifier.stack.pop().unwrap() == AbstractValue::ID {
-                    return Err(verification_failure("ID is leaked into a vector".to_string()));
+                    return Err(move_verification_error("ID is leaked into a vector"));
                 }
             }
             verifier.stack.push(AbstractValue::NonID);
@@ -406,7 +382,7 @@ fn execute_inner(
 
         Bytecode::VecPushBack(_) => {
             if verifier.stack.pop().unwrap() == AbstractValue::ID {
-                return Err(verification_failure("ID is leaked into a vector".to_string()));
+                return Err(move_verification_error("ID is leaked into a vector"));
             }
             verifier.stack.pop().unwrap();
         }
@@ -426,4 +402,26 @@ fn execute_inner(
         }
     };
     Ok(())
+}
+
+fn expect_ok<T>(res: Result<T, PartialVMError>) -> PartialVMResult<T> {
+    match res {
+        Ok(x) => Ok(x),
+        Err(partial_vm_error) => {
+            debug_assert!(
+                false,
+                "Should have been verified to be safe by the Move bytecode verifier, \
+                Got error: {partial_vm_error:?}"
+            );
+            // This is an internal error, but we cannot accept the module as safe
+            Err(PartialVMError::new(
+                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+            ))
+        }
+    }
+}
+
+fn move_verification_error(msg: impl std::fmt::Display) -> PartialVMError {
+    PartialVMError::new(StatusCode::UNKNOWN_VERIFICATION_ERROR)
+        .with_message(format!("Sui Move Bytecode Verification Error: {}", msg))
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 import { ObjectOwner } from './common';
@@ -33,11 +33,99 @@ export type SuiMoveObject = {
   type: string;
   /** Fields and values stored inside the Move object */
   fields: ObjectContentFields;
+  has_public_transfer?: boolean;
+};
+
+export const MIST_PER_SUI: BigInt = BigInt(1000000000);
+
+export type CoinDenominationInfoResponse = {
+  /** Coin type like "0x2::sui::SUI" */
+  coinType: string;
+  /** min unit, like MIST */
+  basicUnit?: string;
+  /** number of zeros in the denomination,
+   * e.g., 9 here for SUI. */
+  decimalNumber: number;
 };
 
 export type SuiMovePackage = {
   /** A mapping from module name to disassembled Move bytecode */
   disassembled: MovePackageContent;
+};
+
+export type SuiMoveFunctionArgTypesResponse = SuiMoveFunctionArgType[];
+
+export type SuiMoveFunctionArgType = string | { Object: string };
+
+export type SuiMoveFunctionArgTypes = SuiMoveFunctionArgType[];
+
+export type SuiMoveNormalizedModules = Record<string, SuiMoveNormalizedModule>;
+
+export type SuiMoveNormalizedModule = {
+  file_format_version: number;
+  address: string;
+  name: string;
+  friends: SuiMoveModuleId[];
+  structs: Record<string, SuiMoveNormalizedStruct>;
+  exposed_functions: Record<string, SuiMoveNormalizedFunction>;
+};
+
+export type SuiMoveModuleId = {
+  address: string;
+  name: string;
+};
+
+export type SuiMoveNormalizedStruct = {
+  abilities: SuiMoveAbilitySet;
+  type_parameters: SuiMoveStructTypeParameter[];
+  fields: SuiMoveNormalizedField[];
+};
+
+export type SuiMoveStructTypeParameter = {
+  constraints: SuiMoveAbilitySet;
+  is_phantom: boolean;
+};
+
+export type SuiMoveNormalizedField = {
+  name: string;
+  type_: SuiMoveNormalizedType;
+};
+
+export type SuiMoveNormalizedFunction = {
+  visibility: SuiMoveVisibility;
+  is_entry: boolean;
+  type_parameters: SuiMoveAbilitySet[];
+  parameters: SuiMoveNormalizedType[];
+  return_: SuiMoveNormalizedType[];
+};
+
+export type SuiMoveVisibility = 'Private' | 'Public' | 'Friend';
+
+export type SuiMoveTypeParameterIndex = number;
+
+export type SuiMoveAbilitySet = {
+  abilities: string[];
+};
+
+export type SuiMoveNormalizedType =
+  | string
+  | SuiMoveNormalizedTypeParameterType
+  | { Reference: SuiMoveNormalizedType }
+  | { MutableReference: SuiMoveNormalizedType }
+  | { Vector: SuiMoveNormalizedType }
+  | SuiMoveNormalizedStructType;
+
+export type SuiMoveNormalizedTypeParameterType = {
+  TypeParameter: SuiMoveTypeParameterIndex;
+};
+
+export type SuiMoveNormalizedStructType = {
+  Struct: {
+    address: string;
+    module: string;
+    name: string;
+    type_arguments: SuiMoveNormalizedType[];
+  };
 };
 
 export type SuiObject = {
@@ -69,6 +157,7 @@ export type GetObjectDataResponse = {
 export type ObjectDigest = string;
 export type ObjectId = string;
 export type SequenceNumber = number;
+export type Order = 'ascending' | 'descending';
 
 /* -------------------------------------------------------------------------- */
 /*                              Helper functions                              */
@@ -144,6 +233,27 @@ export function getObjectOwner(
   return getObjectExistsResponse(resp)?.owner;
 }
 
+export function getSharedObjectInitialVersion(
+  resp: GetObjectDataResponse
+): number | undefined {
+  const owner = getObjectOwner(resp);
+  if (typeof owner === 'object' && 'Shared' in owner) {
+    return owner.Shared.initial_shared_version;
+  } else {
+    return undefined;
+  }
+}
+
+export function isSharedObject(resp: GetObjectDataResponse): boolean {
+  const owner = getObjectOwner(resp);
+  return owner === 'Shared' || (typeof owner === 'object' && 'Shared' in owner);
+}
+
+export function isImmutableObject(resp: GetObjectDataResponse): boolean {
+  const owner = getObjectOwner(resp);
+  return owner === 'Immutable';
+}
+
 export function getMoveObjectType(
   resp: GetObjectDataResponse
 ): string | undefined {
@@ -151,8 +261,11 @@ export function getMoveObjectType(
 }
 
 export function getObjectFields(
-  resp: GetObjectDataResponse
+  resp: GetObjectDataResponse | SuiMoveObject
 ): ObjectContentFields | undefined {
+  if ('fields' in resp) {
+    return resp.fields;
+  }
   return getMoveObject(resp)?.fields;
 }
 
@@ -166,6 +279,12 @@ export function getMoveObject(
   return suiObject.data as SuiMoveObject;
 }
 
+export function hasPublicTransfer(
+  data: GetObjectDataResponse | SuiObject
+): boolean {
+  return getMoveObject(data)?.has_public_transfer ?? false;
+}
+
 export function getMovePackageContent(
   data: GetObjectDataResponse | SuiMovePackage
 ): MovePackageContent | undefined {
@@ -177,4 +296,41 @@ export function getMovePackageContent(
     return undefined;
   }
   return (suiObject.data as SuiMovePackage).disassembled;
+}
+
+export function extractMutableReference(
+  normalizedType: SuiMoveNormalizedType
+): SuiMoveNormalizedType | undefined {
+  return typeof normalizedType === 'object' &&
+    'MutableReference' in normalizedType
+    ? normalizedType.MutableReference
+    : undefined;
+}
+
+export function extractReference(
+  normalizedType: SuiMoveNormalizedType
+): SuiMoveNormalizedType | undefined {
+  return typeof normalizedType === 'object' && 'Reference' in normalizedType
+    ? normalizedType.Reference
+    : undefined;
+}
+
+export function extractStructTag(
+  normalizedType: SuiMoveNormalizedType
+): SuiMoveNormalizedStructType | undefined {
+  if (typeof normalizedType === 'object' && 'Struct' in normalizedType) {
+    return normalizedType;
+  }
+
+  const ref = extractReference(normalizedType);
+  const mutRef = extractMutableReference(normalizedType);
+
+  if (typeof ref === 'object' && 'Struct' in ref) {
+    return ref;
+  }
+
+  if (typeof mutRef === 'object' && 'Struct' in mutRef) {
+    return mutRef;
+  }
+  return undefined;
 }

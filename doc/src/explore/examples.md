@@ -2,11 +2,21 @@
 title: Examples of Sui Smart Contracts
 ---
 
-Find sample Sui smart contract implementations in the [sui_programmability/examples](https://github.com/MystenLabs/sui/tree/main/sui_programmability/examples) directory. Here is a rundown of existing examples.
+Find sample Sui smart contract implementations in the [sui_programmability/examples](https://github.com/MystenLabs/sui/tree/main/sui_programmability/examples) directory. Also see [examples.sui.io](https://examples.sui.io/) for a feature-by-feature guide to [Sui Move](../learn/sui-move-diffs.md).
+
+
+Here is a rundown of existing examples in the Sui repository.
 
 ## Basics
 
 In the [Basics](https://github.com/MystenLabs/sui/tree/main/sui_programmability/examples/basics) example, explore object creation, update, and exchange.
+
+## Crypto
+
+In the [Cryptography](https://github.com/MystenLabs/sui/tree/main/sui_programmability/examples/math) example, employ a simple contract to:
+  * Hash a piece of data using keccak256 and output an object with hashed data.
+  * Recover a [Secp256k1](https://crates.io/crates/secp256k1/) signature to its public key and output an object with the public key.
+  * Verify a Secp256k1 signature and produce an event indicating whether it is verified.
 
 ## DeFi
 

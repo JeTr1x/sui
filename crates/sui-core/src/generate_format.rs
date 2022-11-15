@@ -1,10 +1,11 @@
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use clap::*;
 use move_core_types::{
     language_storage::TypeTag,
     value::{MoveStructLayout, MoveTypeLayout},
+    vm_status::AbortLocation,
 };
 use pretty_assertions::assert_str_eq;
 use serde_reflection::{Registry, Result, Samples, Tracer, TracerConfig};
@@ -13,34 +14,47 @@ use std::{fs::File, io::Write};
 use sui_types::{
     base_types::{self, ObjectDigest, ObjectID, TransactionDigest, TransactionEffectsDigest},
     batch::UpdateItem,
-    crypto::{get_key_pair, AuthoritySignature, Signature},
-    error::SuiError,
+    crypto::{
+        get_key_pair, AccountKeyPair, AuthorityKeyPair, AuthorityPublicKeyBytes,
+        AuthoritySignature, KeypairTraits, Signature,
+    },
     messages::{
-        CallArg, ExecutionStatus, ObjectInfoRequestKind, SingleTransactionKind, TransactionKind,
+        CallArg, EntryArgumentErrorKind, ExecutionFailureStatus, ExecutionStatus, ObjectArg,
+        ObjectInfoRequestKind, SingleTransactionKind, TransactionKind,
     },
     object::{Data, Owner},
+    storage::DeleteKind,
 };
 use typed_store::rocks::TypedStoreError;
 
 fn get_registry() -> Result<Registry> {
-    let mut tracer = Tracer::new(TracerConfig::default());
+    let config = TracerConfig::default()
+        .record_samples_for_structs(true)
+        .record_samples_for_newtype_structs(true);
+    let mut tracer = Tracer::new(config);
     let mut samples = Samples::new();
     // 1. Record samples for types with custom deserializers.
     // We want to call
     // tracer.trace_value(&mut samples, ...)?;
     // with all the base types contained in messages, especially the ones with custom serializers;
     // or involving generics (see [serde_reflection documentation](https://novifinancial.github.io/serde-reflection/serde_reflection/index.html)).
-    let (addr, kp) = get_key_pair();
-    let pk = kp.public_key_bytes();
+    let (addr, kp): (_, AuthorityKeyPair) = get_key_pair();
+    let (s_addr, s_kp): (_, AccountKeyPair) = get_key_pair();
+
+    let pk: AuthorityPublicKeyBytes = kp.public().into();
     tracer.trace_value(&mut samples, &addr)?;
     tracer.trace_value(&mut samples, &kp)?;
     tracer.trace_value(&mut samples, &pk)?;
+
+    tracer.trace_value(&mut samples, &s_addr)?;
+    tracer.trace_value(&mut samples, &s_kp)?;
 
     // We have two signature types: one for Authority Signatures, which don't include the PubKey ...
     let sig: AuthoritySignature = kp.sign(b"hello world");
     tracer.trace_value(&mut samples, &sig)?;
     // ... and the user signature which does
-    let sig: Signature = kp.sign(b"hello world");
+
+    let sig: Signature = s_kp.sign(b"hello world");
     tracer.trace_value(&mut samples, &sig)?;
 
     // ObjectID and SuiAddress are the same length
@@ -58,10 +72,13 @@ fn get_registry() -> Result<Registry> {
     tracer.trace_value(&mut samples, &teff)?;
 
     // 2. Trace the main entry point(s) + every enum separately.
-    tracer.trace_type::<SuiError>(&samples)?;
     tracer.trace_type::<Owner>(&samples)?;
     tracer.trace_type::<ExecutionStatus>(&samples)?;
+    tracer.trace_type::<ExecutionFailureStatus>(&samples)?;
+    tracer.trace_type::<AbortLocation>(&samples)?;
+    tracer.trace_type::<EntryArgumentErrorKind>(&samples)?;
     tracer.trace_type::<CallArg>(&samples)?;
+    tracer.trace_type::<ObjectArg>(&samples)?;
     tracer.trace_type::<Data>(&samples)?;
     tracer.trace_type::<TypeTag>(&samples)?;
     tracer.trace_type::<TypedStoreError>(&samples)?;
@@ -72,6 +89,7 @@ fn get_registry() -> Result<Registry> {
     tracer.trace_type::<MoveTypeLayout>(&samples)?;
     tracer.trace_type::<base_types::SuiAddress>(&samples)?;
     tracer.trace_type::<UpdateItem>(&samples)?;
+    tracer.trace_type::<DeleteKind>(&samples)?;
 
     tracer.registry()
 }

@@ -1,86 +1,169 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #[test_only]
 module sui::bag_tests {
-    use sui::bag::{Self, Bag};
-    use sui::id::{Self, VersionedID};
-    use sui::test_scenario;
-    use sui::tx_context;
 
-    const EBAG_SIZE_MISMATCH: u64 = 0;
-    const EOBJECT_NOT_FOUND: u64 = 1;
+use sui::bag::{Self, add, contains_with_type, borrow, borrow_mut, remove};
+use sui::test_scenario as ts;
 
-    struct Object1 has key, store {
-        id: VersionedID,
-    }
+#[test]
+fun simple_all_functions() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    // add fields
+    add(&mut bag, b"hello", 0);
+    add(&mut bag, 1, 1u8);
+    // check they exist
+    assert!(contains_with_type<vector<u8>, u64>(&bag, b"hello"), 0);
+    assert!(contains_with_type<u64, u8>(&bag, 1), 0);
+    // check the values
+    assert!(*borrow(&bag, b"hello") == 0, 0);
+    assert!(*borrow(&bag, 1) == 1u8, 0);
+    // mutate them
+    *borrow_mut(&mut bag, b"hello") = *borrow(&bag, b"hello") * 2;
+    *borrow_mut(&mut bag, 1) = *borrow(&bag, 1) * 2u8;
+    // check the new value
+    assert!(*borrow(&bag, b"hello") == 0, 0);
+    assert!(*borrow(&bag, 1) == 2u8, 0);
+    // remove the value and check it
+    assert!(remove(&mut bag, b"hello") == 0, 0);
+    assert!(remove(&mut bag, 1) == 2u8, 0);
+    // verify that they are not there
+    assert!(!contains_with_type<vector<u8>, u64>(&bag, b"hello"), 0);
+    assert!(!contains_with_type<u64, u8>(&bag, 1), 0);
+    ts::end(scenario);
+    bag::destroy_empty(bag);
+}
 
-    struct Object2 has key, store {
-        id: VersionedID,
-    }
+#[test]
+#[expected_failure(abort_code = 0)]
+fun add_duplicate() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    add(&mut bag, b"hello", 0u8);
+    add(&mut bag, b"hello", 1u8);
+    abort 42
+}
 
-    #[test]
-    fun test_bag() {
-        let sender = @0x0;
-        let scenario = &mut test_scenario::begin(&sender);
+#[test]
+#[expected_failure(abort_code = 0)]
+fun add_duplicate_mismatched_type() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    add(&mut bag, b"hello", 0u128);
+    add(&mut bag, b"hello", 1u8);
+    abort 42
+}
 
-        // Create a new Bag and transfer it to the sender.
-        test_scenario::next_tx(scenario, &sender);
-        {
-            bag::create(test_scenario::ctx(scenario));
-        };
+#[test]
+#[expected_failure(abort_code = 1)]
+fun borrow_missing() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    borrow<u64, u64>(&bag, 0);
+    abort 42
+}
 
-        // Add two objects of different types into the bag.
-        test_scenario::next_tx(scenario, &sender);
-        {
-            let bag = test_scenario::take_owned<Bag>(scenario);
-            assert!(bag::size(&bag) == 0, EBAG_SIZE_MISMATCH);
+#[test]
+#[expected_failure(abort_code = 2)]
+fun borrow_wrong_type() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    add(&mut bag, 0, 0);
+    borrow<u64, u8>(&mut bag, 0);
+    abort 42
+}
 
-            let obj1 = Object1 { id: tx_context::new_id(test_scenario::ctx(scenario)) };
-            let id1 = *id::id(&obj1);
-            let obj2 = Object2 { id: tx_context::new_id(test_scenario::ctx(scenario)) };
-            let id2 = *id::id(&obj2);
+#[test]
+#[expected_failure(abort_code = 1)]
+fun borrow_mut_missing() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    borrow_mut<u64, u64>(&mut bag, 0);
+    abort 42
+}
 
-            bag::add(&mut bag, obj1);
-            bag::add(&mut bag, obj2);
-            assert!(bag::size(&bag) == 2, EBAG_SIZE_MISMATCH);
+#[test]
+#[expected_failure(abort_code = 2)]
+fun borrow_mut_wrong_type() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    add(&mut bag, 0, 0);
+    borrow_mut<u64, u8>(&mut bag, 0);
+    abort 42
+}
 
-            assert!(bag::contains(&bag, &id1), EOBJECT_NOT_FOUND);
-            assert!(bag::contains(&bag, &id2), EOBJECT_NOT_FOUND);
+#[test]
+#[expected_failure(abort_code = 1)]
+fun remove_missing() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    remove<u64, u64>(&mut bag, 0);
+    abort 42
+}
 
-            test_scenario::return_owned(scenario, bag);
-        };
-        // TODO: Test object removal once we can retrieve object owned objects from test_scenario.
-    }
+#[test]
+#[expected_failure(abort_code = 2)]
+fun remove_wrong_type() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    add(&mut bag, 0, 0);
+    remove<u64, u8>(&mut bag, 0);
+    abort 42
+}
 
-    #[test]
-    #[expected_failure(abort_code = 520)]
-    fun test_init_with_invalid_max_capacity() {
-        let ctx = tx_context::dummy();
-        // Sui::bag::DEFAULT_MAX_CAPACITY is not readable outside the module
-        let max_capacity = 65536;
-        let bag = bag::new_with_max_capacity(&mut ctx, max_capacity + 1);
-        bag::transfer(bag, tx_context::sender(&ctx));
-    }
+#[test]
+#[expected_failure(abort_code = 0)]
+fun destroy_non_empty() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    add(&mut bag, 0, 0);
+    bag::destroy_empty(bag);
+    ts::end(scenario);
+}
 
-    #[test]
-    #[expected_failure(abort_code = 520)]
-    fun test_init_with_zero() {
-        let ctx = tx_context::dummy();
-        let bag = bag::new_with_max_capacity(&mut ctx, 0);
-        bag::transfer(bag, tx_context::sender(&ctx));
-    }
+#[test]
+fun sanity_check_contains() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    assert!(!contains_with_type<u64, u64>(&mut bag, 0), 0);
+    add(&mut bag, 0, 0);
+    assert!(contains_with_type<u64, u64>(&mut bag, 0), 0);
+    assert!(!contains_with_type<u64, u64>(&mut bag, 1), 0);
+    ts::end(scenario);
+    bag::remove<u64, u64>(&mut bag, 0);
+    bag::destroy_empty(bag);
+}
 
-    #[test]
-    #[expected_failure(abort_code = 776)]
-    fun test_exceed_max_capacity() {
-        let ctx = tx_context::dummy();
-        let bag = bag::new_with_max_capacity(&mut ctx, 1);
+#[test]
+fun sanity_check_size() {
+    let sender = @0x0;
+    let scenario = ts::begin(sender);
+    let bag = bag::new(ts::ctx(&mut scenario));
+    assert!(bag::is_empty(&bag), 0);
+    assert!(bag::length(&bag) == 0, 0);
+    add(&mut bag, 0, 0);
+    assert!(!bag::is_empty(&bag), 0);
+    assert!(bag::length(&bag) == 1, 0);
+    add(&mut bag, 1, 0);
+    assert!(!bag::is_empty(&bag), 0);
+    assert!(bag::length(&bag) == 2, 0);
+    bag::remove<u64, u64>(&mut bag, 0);
+    bag::remove<u64, u64>(&mut bag, 1);
+    ts::end(scenario);
+    bag::destroy_empty(bag);
+}
 
-        let obj1 = Object1 { id: tx_context::new_id(&mut ctx) };
-        bag::add(&mut bag, obj1);
-        let obj2 = Object2 { id: tx_context::new_id(&mut ctx) };
-        bag::add(&mut bag, obj2);
-        bag::transfer(bag, tx_context::sender(&ctx));
-    }
 }

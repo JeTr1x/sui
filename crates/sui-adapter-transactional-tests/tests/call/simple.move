@@ -1,17 +1,17 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //# init --addresses Test=0x0 A=0x42
 
 //# publish
 module Test::M1 {
-    use sui::id::VersionedID;
-    use sui::tx_context::{Self, TxContext};
+    use sui::object::{Self, UID};
+    use sui::tx_context::TxContext;
     use sui::transfer;
     use sui::coin::Coin;
 
     struct Object has key, store {
-        id: VersionedID,
+        id: UID,
         value: u64,
     }
 
@@ -21,7 +21,7 @@ module Test::M1 {
 
     public entry fun create(value: u64, recipient: address, ctx: &mut TxContext) {
         transfer::transfer(
-            Object { id: tx_context::new_id(ctx), value },
+            Object { id: object::new(ctx), value },
             recipient
         )
     }

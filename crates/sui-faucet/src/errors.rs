@@ -1,15 +1,26 @@
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum FaucetError {
+    #[error("Faucet cannot read objects from fullnode")]
+    FullnodeReadingError,
+
+    #[error(
+        "Gas coin `{0}` does not have sufficient balance and has been removed from gas coin pool"
+    )]
+    GasCoinWithInsufficientBalance(String),
+
     #[error("Faucet does not have enough balance")]
     InsuffientBalance,
 
-    #[error("Faucet needs at least {0} coins, but only has {1} coin")]
-    InsuffientCoins(usize, usize),
+    #[error("Gas coin `{0}` is not valid and has been removed from gas coin pool")]
+    InvalidGasCoin(String),
+
+    #[error("No gas coin available in the gas coin pool")]
+    NoGasCoinAvailable,
 
     #[error("Wallet Error: `{0}`")]
     Wallet(String),

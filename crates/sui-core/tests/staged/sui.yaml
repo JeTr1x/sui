@@ -1,4 +1,12 @@
 ---
+AbortLocation:
+  ENUM:
+    0:
+      Module:
+        NEWTYPE:
+          TYPENAME: ModuleId
+    1:
+      Script: UNIT
 AccountAddress:
   NEWTYPESTRUCT:
     TUPLEARRAY:
@@ -18,11 +26,23 @@ AuthorityBatch:
         TUPLEARRAY:
           CONTENT: U8
           SIZE: 32
-AuthoritySignature:
-  NEWTYPESTRUCT:
-    TUPLEARRAY:
-      CONTENT: U8
-      SIZE: 64
+AuthorityPublicKeyBytes:
+  NEWTYPESTRUCT: BYTES
+AuthoritySignInfo:
+  STRUCT:
+    - epoch: U64
+    - authority:
+        TYPENAME: AuthorityPublicKeyBytes
+    - signature:
+        TYPENAME: BLS12381Signature
+BLS12381KeyPair:
+  STRUCT:
+    - type: STR
+    - name: STR
+    - secret: STR
+BLS12381Signature:
+  STRUCT:
+    - sig: BYTES
 CallArg:
   ENUM:
     0:
@@ -30,21 +50,24 @@ CallArg:
         NEWTYPE:
           SEQ: U8
     1:
-      ImmOrOwnedObject:
+      Object:
         NEWTYPE:
-          TUPLE:
-            - TYPENAME: ObjectID
-            - TYPENAME: SequenceNumber
-            - TYPENAME: ObjectDigest
+          TYPENAME: ObjectArg
     2:
-      SharedObject:
+      ObjVec:
         NEWTYPE:
-          TYPENAME: ObjectID
+          SEQ:
+            TYPENAME: ObjectArg
 ChangeEpoch:
   STRUCT:
     - epoch: U64
     - storage_charge: U64
     - computation_charge: U64
+    - storage_rebate: U64
+CircularObjectOwnership:
+  STRUCT:
+    - object:
+        TYPENAME: ObjectID
 Data:
   ENUM:
     0:
@@ -55,33 +78,170 @@ Data:
       Package:
         NEWTYPE:
           TYPENAME: MovePackage
+DeleteKind:
+  ENUM:
+    0:
+      Normal: UNIT
+    1:
+      UnwrapThenDelete: UNIT
+    2:
+      Wrap: UNIT
+Ed25519KeyPair:
+  STRUCT:
+    - type: STR
+    - name:
+        TYPENAME: Ed25519PublicKey
+    - secret:
+        TYPENAME: Ed25519PublicKey
+Ed25519PublicKey:
+  NEWTYPESTRUCT: STR
+EntryArgumentError:
+  STRUCT:
+    - argument_idx: U8
+    - kind:
+        TYPENAME: EntryArgumentErrorKind
+EntryArgumentErrorKind:
+  ENUM:
+    0:
+      TypeMismatch: UNIT
+    1:
+      InvalidObjectByValue: UNIT
+    2:
+      InvalidObjectByMuteRef: UNIT
+    3:
+      ObjectKindMismatch: UNIT
+    4:
+      UnsupportedPureArg: UNIT
+    5:
+      ArityMismatch: UNIT
+Envelope:
+  STRUCT:
+    - data:
+        TYPENAME: AuthorityBatch
+    - auth_signature:
+        TYPENAME: AuthoritySignInfo
 ExecutionDigests:
   STRUCT:
     - transaction:
         TYPENAME: TransactionDigest
     - effects:
         TYPENAME: TransactionEffectsDigest
+ExecutionFailureStatus:
+  ENUM:
+    0:
+      InsufficientGas: UNIT
+    1:
+      InvalidGasObject: UNIT
+    2:
+      InvalidTransactionUpdate: UNIT
+    3:
+      ModuleNotFound: UNIT
+    4:
+      FunctionNotFound: UNIT
+    5:
+      InvariantViolation: UNIT
+    6:
+      InvalidTransferObject: UNIT
+    7:
+      InvalidTransferSui: UNIT
+    8:
+      InvalidTransferSuiInsufficientBalance: UNIT
+    9:
+      InvalidCoinObject: UNIT
+    10:
+      EmptyInputCoins: UNIT
+    11:
+      EmptyRecipients: UNIT
+    12:
+      RecipientsAmountsArityMismatch: UNIT
+    13:
+      InsufficientBalance: UNIT
+    14:
+      CoinTypeMismatch: UNIT
+    15:
+      NonEntryFunctionInvoked: UNIT
+    16:
+      EntryTypeArityMismatch: UNIT
+    17:
+      EntryArgumentError:
+        NEWTYPE:
+          TYPENAME: EntryArgumentError
+    18:
+      CircularObjectOwnership:
+        NEWTYPE:
+          TYPENAME: CircularObjectOwnership
+    19:
+      InvalidChildObjectArgument:
+        NEWTYPE:
+          TYPENAME: InvalidChildObjectArgument
+    20:
+      InvalidSharedByValue:
+        NEWTYPE:
+          TYPENAME: InvalidSharedByValue
+    21:
+      TooManyChildObjects:
+        STRUCT:
+          - object:
+              TYPENAME: ObjectID
+    22:
+      InvalidParentDeletion:
+        STRUCT:
+          - parent:
+              TYPENAME: ObjectID
+          - kind:
+              OPTION:
+                TYPENAME: DeleteKind
+    23:
+      InvalidParentFreezing:
+        STRUCT:
+          - parent:
+              TYPENAME: ObjectID
+    24:
+      PublishErrorEmptyPackage: UNIT
+    25:
+      PublishErrorNonZeroAddress: UNIT
+    26:
+      PublishErrorDuplicateModule: UNIT
+    27:
+      SuiMoveVerificationError: UNIT
+    28:
+      MovePrimitiveRuntimeError: UNIT
+    29:
+      MoveAbort:
+        TUPLE:
+          - TYPENAME: ModuleId
+          - U64
+    30:
+      VMVerificationOrDeserializationError: UNIT
+    31:
+      VMInvariantViolation: UNIT
 ExecutionStatus:
   ENUM:
     0:
-      Success:
-        STRUCT:
-          - gas_cost:
-              TYPENAME: GasCostSummary
+      Success: UNIT
     1:
       Failure:
         STRUCT:
-          - gas_cost:
-              TYPENAME: GasCostSummary
           - error:
-              TYPENAME: SuiError
-GasCostSummary:
-  STRUCT:
-    - computation_cost: U64
-    - storage_cost: U64
-    - storage_rebate: U64
+              TYPENAME: ExecutionFailureStatus
 Identifier:
   NEWTYPESTRUCT: STR
+InvalidChildObjectArgument:
+  STRUCT:
+    - child:
+        TYPENAME: ObjectID
+    - parent:
+        TYPENAME: SuiAddress
+InvalidSharedByValue:
+  STRUCT:
+    - object:
+        TYPENAME: ObjectID
+ModuleId:
+  STRUCT:
+    - address:
+        TYPENAME: AccountAddress
+    - name:
+        TYPENAME: Identifier
 MoveCall:
   STRUCT:
     - package:
@@ -113,6 +273,9 @@ MoveObject:
   STRUCT:
     - type_:
         TYPENAME: StructTag
+    - has_public_transfer: BOOL
+    - version:
+        TYPENAME: SequenceNumber
     - contents: BYTES
 MovePackage:
   STRUCT:
@@ -164,6 +327,28 @@ MoveTypeLayout:
           TYPENAME: MoveStructLayout
     7:
       signer: UNIT
+    8:
+      u16: UNIT
+    9:
+      u32: UNIT
+    10:
+      u256: UNIT
+ObjectArg:
+  ENUM:
+    0:
+      ImmOrOwnedObject:
+        NEWTYPE:
+          TUPLE:
+            - TYPENAME: ObjectID
+            - TYPENAME: SequenceNumber
+            - TYPENAME: ObjectDigest
+    1:
+      SharedObject:
+        STRUCT:
+          - id:
+              TYPENAME: ObjectID
+          - initial_shared_version:
+              TYPENAME: SequenceNumber
 ObjectDigest:
   NEWTYPESTRUCT: BYTES
 ObjectFormatOptions:
@@ -183,6 +368,12 @@ ObjectInfoRequestKind:
       PastObjectInfo:
         NEWTYPE:
           TYPENAME: SequenceNumber
+    2:
+      PastObjectInfoDebug:
+        TUPLE:
+          - TYPENAME: SequenceNumber
+          - OPTION:
+              TYPENAME: ObjectFormatOptions
 Owner:
   ENUM:
     0:
@@ -194,29 +385,56 @@ Owner:
         NEWTYPE:
           TYPENAME: SuiAddress
     2:
-      Shared: UNIT
+      Shared:
+        STRUCT:
+          - initial_shared_version:
+              TYPENAME: SequenceNumber
     3:
       Immutable: UNIT
-PublicKeyBytes:
-  NEWTYPESTRUCT: BYTES
+Pay:
+  STRUCT:
+    - coins:
+        SEQ:
+          TUPLE:
+            - TYPENAME: ObjectID
+            - TYPENAME: SequenceNumber
+            - TYPENAME: ObjectDigest
+    - recipients:
+        SEQ:
+          TYPENAME: SuiAddress
+    - amounts:
+        SEQ: U64
+PayAllSui:
+  STRUCT:
+    - coins:
+        SEQ:
+          TUPLE:
+            - TYPENAME: ObjectID
+            - TYPENAME: SequenceNumber
+            - TYPENAME: ObjectDigest
+    - recipient:
+        TYPENAME: SuiAddress
+PaySui:
+  STRUCT:
+    - coins:
+        SEQ:
+          TUPLE:
+            - TYPENAME: ObjectID
+            - TYPENAME: SequenceNumber
+            - TYPENAME: ObjectDigest
+    - recipients:
+        SEQ:
+          TYPENAME: SuiAddress
+    - amounts:
+        SEQ: U64
 SequenceNumber:
   NEWTYPESTRUCT: U64
-Signature:
-  NEWTYPESTRUCT: BYTES
-SignedBatch:
-  STRUCT:
-    - batch:
-        TYPENAME: AuthorityBatch
-    - authority:
-        TYPENAME: PublicKeyBytes
-    - signature:
-        TYPENAME: AuthoritySignature
 SingleTransactionKind:
   ENUM:
     0:
-      TransferCoin:
+      TransferObject:
         NEWTYPE:
-          TYPENAME: TransferCoin
+          TYPENAME: TransferObject
     1:
       Publish:
         NEWTYPE:
@@ -230,6 +448,18 @@ SingleTransactionKind:
         NEWTYPE:
           TYPENAME: TransferSui
     4:
+      Pay:
+        NEWTYPE:
+          TYPENAME: Pay
+    5:
+      PaySui:
+        NEWTYPE:
+          TYPENAME: PaySui
+    6:
+      PayAllSui:
+        NEWTYPE:
+          TYPENAME: PayAllSui
+    7:
       ChangeEpoch:
         NEWTYPE:
           TYPENAME: ChangeEpoch
@@ -249,426 +479,6 @@ SuiAddress:
     TUPLEARRAY:
       CONTENT: U8
       SIZE: 20
-SuiError:
-  ENUM:
-    0:
-      LockErrors:
-        STRUCT:
-          - errors:
-              SEQ:
-                TYPENAME: SuiError
-    1:
-      TransferUnownedError: UNIT
-    2:
-      TransferNonCoinError: UNIT
-    3:
-      MoveObjectAsPackage:
-        STRUCT:
-          - object_id:
-              TYPENAME: ObjectID
-    4:
-      TransferInsufficientBalance:
-        STRUCT:
-          - balance: U64
-          - required: U64
-    5:
-      MovePackageAsObject:
-        STRUCT:
-          - object_id:
-              TYPENAME: ObjectID
-    6:
-      UnexpectedOwnerType: UNIT
-    7:
-      UnsupportedSharedObjectError: UNIT
-    8:
-      NotSharedObjectError: UNIT
-    9:
-      DeleteObjectOwnedObject: UNIT
-    10:
-      SharedObjectLockNotSetObject: UNIT
-    11:
-      InvalidBatchTransaction:
-        STRUCT:
-          - error: STR
-    12:
-      MissingObjectOwner:
-        STRUCT:
-          - child_id:
-              TYPENAME: ObjectID
-          - parent_id:
-              TYPENAME: ObjectID
-    13:
-      InvalidSignature:
-        STRUCT:
-          - error: STR
-    14:
-      IncorrectSigner:
-        STRUCT:
-          - error: STR
-    15:
-      UnknownSigner: UNIT
-    16:
-      WrongEpoch:
-        STRUCT:
-          - expected_epoch: U64
-    17:
-      CertificateRequiresQuorum: UNIT
-    18:
-      UnexpectedSequenceNumber:
-        STRUCT:
-          - object_id:
-              TYPENAME: ObjectID
-          - expected_sequence:
-              TYPENAME: SequenceNumber
-          - given_sequence:
-              TYPENAME: SequenceNumber
-    19:
-      ConflictingTransaction:
-        STRUCT:
-          - pending_transaction:
-              TYPENAME: TransactionDigest
-    20:
-      ErrorWhileProcessingTransactionTransaction:
-        STRUCT:
-          - err: STR
-    21:
-      ErrorWhileProcessingConfirmationTransaction:
-        STRUCT:
-          - err: STR
-    22:
-      QuorumFailedToExecuteCertificate:
-        STRUCT:
-          - errors:
-              SEQ:
-                TYPENAME: SuiError
-    23:
-      ErrorWhileProcessingPublish:
-        STRUCT:
-          - err: STR
-    24:
-      ErrorWhileProcessingMoveCall:
-        STRUCT:
-          - err: STR
-    25:
-      ErrorWhileRequestingInformation: UNIT
-    26:
-      ObjectFetchFailed:
-        STRUCT:
-          - object_id:
-              TYPENAME: ObjectID
-          - err: STR
-    27:
-      MissingEarlierConfirmations:
-        STRUCT:
-          - object_id:
-              TYPENAME: ObjectID
-          - current_sequence_number:
-              TYPENAME: SequenceNumber
-    28:
-      InvalidSystemTransaction: UNIT
-    29:
-      UnexpectedTransactionIndex: UNIT
-    30:
-      ConcurrentIteratorError: UNIT
-    31:
-      ClosedNotifierError: UNIT
-    32:
-      CertificateNotfound:
-        STRUCT:
-          - certificate_digest:
-              TYPENAME: TransactionDigest
-    33:
-      ParentNotfound:
-        STRUCT:
-          - object_id:
-              TYPENAME: ObjectID
-          - sequence:
-              TYPENAME: SequenceNumber
-    34:
-      UnknownSenderAccount: UNIT
-    35:
-      CertificateAuthorityReuse: UNIT
-    36:
-      InvalidSequenceNumber: UNIT
-    37:
-      SequenceOverflow: UNIT
-    38:
-      SequenceUnderflow: UNIT
-    39:
-      WrongShard: UNIT
-    40:
-      InvalidCrossShardUpdate: UNIT
-    41:
-      InvalidAuthenticator: UNIT
-    42:
-      InvalidAddress: UNIT
-    43:
-      InvalidTransactionDigest: UNIT
-    44:
-      InvalidObjectDigest:
-        STRUCT:
-          - object_id:
-              TYPENAME: ObjectID
-          - expected_digest:
-              TYPENAME: ObjectDigest
-    45:
-      InvalidDecoding: UNIT
-    46:
-      UnexpectedMessage: UNIT
-    47:
-      DuplicateObjectRefInput: UNIT
-    48:
-      ClientIoError:
-        STRUCT:
-          - error: STR
-    49:
-      TransferImmutableError: UNIT
-    50:
-      TooManyItemsError:
-        NEWTYPE: U64
-    51:
-      InvalidSequenceRangeError: UNIT
-    52:
-      NoBatchesFoundError: UNIT
-    53:
-      CannotSendClientMessageError: UNIT
-    54:
-      SubscriptionItemsDroppedError:
-        NEWTYPE: U64
-    55:
-      SubscriptionServiceClosed: UNIT
-    56:
-      CheckpointingError:
-        STRUCT:
-          - error: STR
-    57:
-      ModuleLoadFailure:
-        STRUCT:
-          - error: STR
-    58:
-      ModuleVerificationFailure:
-        STRUCT:
-          - error: STR
-    59:
-      ModuleDeserializationFailure:
-        STRUCT:
-          - error: STR
-    60:
-      ModulePublishFailure:
-        STRUCT:
-          - error: STR
-    61:
-      ModuleBuildFailure:
-        STRUCT:
-          - error: STR
-    62:
-      DependentPackageNotFound:
-        STRUCT:
-          - package_id:
-              TYPENAME: ObjectID
-    63:
-      MoveUnitTestFailure:
-        STRUCT:
-          - error: STR
-    64:
-      FunctionNotFound:
-        STRUCT:
-          - error: STR
-    65:
-      ModuleNotFound:
-        STRUCT:
-          - module_name: STR
-    66:
-      InvalidFunctionSignature:
-        STRUCT:
-          - error: STR
-    67:
-      InvalidNonEntryFunction:
-        STRUCT:
-          - error: STR
-    68:
-      TypeError:
-        STRUCT:
-          - error: STR
-    69:
-      AbortedExecution:
-        STRUCT:
-          - error: STR
-    70:
-      InvalidMoveEvent:
-        STRUCT:
-          - error: STR
-    71:
-      CircularObjectOwnership: UNIT
-    72:
-      InvalidSharedChildUse:
-        STRUCT:
-          - child:
-              TYPENAME: ObjectID
-          - child_module: STR
-          - ancestor:
-              TYPENAME: ObjectID
-          - ancestor_module: STR
-          - current_module: STR
-    73:
-      GasBudgetTooHigh:
-        STRUCT:
-          - error: STR
-    74:
-      InsufficientGas:
-        STRUCT:
-          - error: STR
-    75:
-      InvalidTxUpdate: UNIT
-    76:
-      TransactionLockExists:
-        STRUCT:
-          - refs:
-              SEQ:
-                TUPLE:
-                  - TYPENAME: ObjectID
-                  - TYPENAME: SequenceNumber
-                  - TYPENAME: ObjectDigest
-    77:
-      TransactionLockDoesNotExist: UNIT
-    78:
-      TransactionLockReset: UNIT
-    79:
-      TransactionNotFound:
-        STRUCT:
-          - digest:
-              TYPENAME: TransactionDigest
-    80:
-      ObjectNotFound:
-        STRUCT:
-          - object_id:
-              TYPENAME: ObjectID
-    81:
-      ObjectDeleted:
-        STRUCT:
-          - object_ref:
-              TUPLE:
-                - TYPENAME: ObjectID
-                - TYPENAME: SequenceNumber
-                - TYPENAME: ObjectDigest
-    82:
-      BadObjectType:
-        STRUCT:
-          - error: STR
-    83:
-      MoveExecutionFailure: UNIT
-    84:
-      ObjectInputArityViolation: UNIT
-    85:
-      ExecutionInvariantViolation: UNIT
-    86:
-      AuthorityInformationUnavailable: UNIT
-    87:
-      AuthorityUpdateFailure: UNIT
-    88:
-      ByzantineAuthoritySuspicion:
-        STRUCT:
-          - authority:
-              TYPENAME: PublicKeyBytes
-    89:
-      PairwiseSyncFailed:
-        STRUCT:
-          - xsource:
-              TYPENAME: PublicKeyBytes
-          - destination:
-              TYPENAME: PublicKeyBytes
-          - tx_digest:
-              TYPENAME: TransactionDigest
-          - error:
-              TYPENAME: SuiError
-    90:
-      StorageError:
-        NEWTYPE:
-          TYPENAME: TypedStoreError
-    91:
-      BatchErrorSender: UNIT
-    92:
-      GenericAuthorityError:
-        STRUCT:
-          - error: STR
-    93:
-      EventFailedToDispatch:
-        STRUCT:
-          - error: STR
-    94:
-      QuorumNotReached:
-        STRUCT:
-          - errors:
-              SEQ:
-                TYPENAME: SuiError
-    95:
-      ObjectSerializationError:
-        STRUCT:
-          - error: STR
-    96:
-      ConcurrentTransactionError: UNIT
-    97:
-      IncorrectRecipientError: UNIT
-    98:
-      TooManyIncorrectAuthorities:
-        STRUCT:
-          - errors:
-              SEQ:
-                TUPLE:
-                  - TYPENAME: PublicKeyBytes
-                  - TYPENAME: SuiError
-    99:
-      InconsistentGatewayResult:
-        STRUCT:
-          - error: STR
-    100:
-      GatewayInvalidTxRangeQuery:
-        STRUCT:
-          - error: STR
-    101:
-      OnlyOneConsensusClientPermitted: UNIT
-    102:
-      ConsensusConnectionBroken:
-        NEWTYPE: STR
-    103:
-      FailedToHearBackFromConsensus:
-        NEWTYPE: STR
-    104:
-      SharedObjectLockingFailure:
-        NEWTYPE: STR
-    105:
-      ListenerCapacityExceeded: UNIT
-    106:
-      ConsensusSuiSerializationError:
-        NEWTYPE: STR
-    107:
-      NotASharedObjectTransaction: UNIT
-    108:
-      SignatureSeedInvalidLength:
-        NEWTYPE: U64
-    109:
-      HkdfError:
-        NEWTYPE: STR
-    110:
-      SignatureKeyGenError:
-        NEWTYPE: STR
-    111:
-      ValidatorHaltedAtEpochEnd: UNIT
-    112:
-      InconsistentEpochState:
-        STRUCT:
-          - error: STR
-    113:
-      RpcError:
-        NEWTYPE: STR
-    114:
-      UnsupportedFeatureError:
-        STRUCT:
-          - error: STR
-    115:
-      QuorumDriverCommunicationError:
-        STRUCT:
-          - error: STR
 TransactionDigest:
   NEWTYPESTRUCT: BYTES
 TransactionEffectsDigest:
@@ -684,7 +494,7 @@ TransactionKind:
         NEWTYPE:
           SEQ:
             TYPENAME: SingleTransactionKind
-TransferCoin:
+TransferObject:
   STRUCT:
     - recipient:
         TYPENAME: SuiAddress
@@ -721,6 +531,12 @@ TypeTag:
       struct:
         NEWTYPE:
           TYPENAME: StructTag
+    8:
+      u16: UNIT
+    9:
+      u32: UNIT
+    10:
+      u256: UNIT
 TypedStoreError:
   ENUM:
     0:
@@ -734,6 +550,8 @@ TypedStoreError:
         NEWTYPE: STR
     3:
       CrossDBBatch: UNIT
+    4:
+      MetricsReporting: UNIT
 UpdateItem:
   ENUM:
     0:
@@ -745,5 +563,5 @@ UpdateItem:
     1:
       Batch:
         NEWTYPE:
-          TYPENAME: SignedBatch
+          TYPENAME: Envelope
 

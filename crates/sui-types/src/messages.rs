@@ -1,21 +1,29 @@
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
-// Copyright (c) 2022, Mysten Labs, Inc.
+// Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-
 use super::{base_types::*, batch::*, committee::Committee, error::*, event::Event};
 use crate::committee::{EpochId, StakeUnit};
 use crate::crypto::{
-    sha3_hash, AuthorityQuorumSignInfo, AuthoritySignInfo, AuthoritySignature, BcsSignable,
-    EmptySignInfo, Signable, Signature, VerificationObligation,
+    sha3_hash, AuthoritySignInfo, AuthoritySignInfoTrait, AuthoritySignature,
+    AuthorityStrongQuorumSignInfo, Ed25519SuiSignature, EmptySignInfo, Signable, Signature,
+    SignatureScheme, SuiSignature, SuiSignatureInner, ToFromBytes,
 };
 use crate::gas::GasCostSummary;
-use crate::messages_checkpoint::CheckpointFragment;
+use crate::message_envelope::{Envelope, Message, TrustedEnvelope, VerifiedEnvelope};
+use crate::messages_checkpoint::{
+    AuthenticatedCheckpoint, CheckpointSequenceNumber, CheckpointSignatureMessage,
+    SignedCheckpointFragmentMessage,
+};
 use crate::object::{Object, ObjectFormatOptions, Owner, OBJECT_START_VERSION};
-use crate::SUI_SYSTEM_STATE_OBJECT_ID;
-use base64ct::Encoding;
+use crate::storage::{DeleteKind, WriteKind};
+use crate::{SUI_SYSTEM_STATE_OBJECT_ID, SUI_SYSTEM_STATE_OBJECT_SHARED_VERSION};
+use byteorder::{BigEndian, ReadBytesExt};
+use fastcrypto::encoding::{Base64, Encoding};
 use itertools::Either;
 use move_binary_format::access::ModuleAccess;
+use move_binary_format::file_format::LocalIndex;
 use move_binary_format::CompiledModule;
+use move_core_types::language_storage::ModuleId;
 use move_core_types::{
     account_address::AccountAddress, identifier::Identifier, language_storage::TypeTag,
     value::MoveStructLayout,
@@ -23,15 +31,16 @@ use move_core_types::{
 use name_variant::NamedVariant;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
-use serde_name::{DeserializeNameAdapter, SerializeNameAdapter};
 use serde_with::serde_as;
 use serde_with::Bytes;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     hash::{Hash, Hasher},
 };
+use tracing::debug;
 
 #[cfg(test)]
 #[path = "unit_tests/messages_tests.rs"]
@@ -41,15 +50,25 @@ mod messages_tests;
 pub enum CallArg {
     // contains no structs or objects
     Pure(Vec<u8>),
-    // TODO support more than one object (object vector of some sort)
+    // an object
+    Object(ObjectArg),
+    // a vector of objects
+    ObjVec(Vec<ObjectArg>),
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+pub enum ObjectArg {
     // A Move object, either immutable, or owned mutable.
     ImmOrOwnedObject(ObjectRef),
     // A Move object that's shared and mutable.
-    SharedObject(ObjectID),
+    SharedObject {
+        id: ObjectID,
+        initial_shared_version: SequenceNumber,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
-pub struct TransferCoin {
+pub struct TransferObject {
     pub recipient: SuiAddress,
     pub object_ref: ObjectRef,
 }
@@ -75,10 +94,60 @@ pub struct MoveModulePublish {
     pub modules: Vec<Vec<u8>>,
 }
 
+// TODO: we can deprecate TransferSui when its callsites on RPC & SDK are
+// fully replaced by PaySui and PayAllSui.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct TransferSui {
     pub recipient: SuiAddress,
     pub amount: Option<u64>,
+}
+
+/// Send all SUI coins to one recipient.
+/// only for SUI coin and does not require a separate gas coin object either.
+/// Specifically, what pay_all_sui does are:
+/// 1. accumulate all SUI from input coins and deposit all SUI to the first input coin
+/// 2. transfer the updated first coin to the recipient and also use this first coin as
+/// gas coin object.
+/// 3. the balance of the first input coin after tx is sum(input_coins) - actual_gas_cost.
+/// 4. all other input coins other than the first are deleted.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+pub struct PayAllSui {
+    /// The coins to be used for payment.
+    pub coins: Vec<ObjectRef>,
+    /// The address that will receive payment
+    pub recipient: SuiAddress,
+}
+
+/// Send SUI coins to a list of addresses, following a list of amounts.
+/// only for SUI coin and does not require a separate gas coin object.
+/// Specifically, what pay_sui does are:
+/// 1. debit each input_coin to create new coin following the order of
+/// amounts and assign it to the corresponding recipient.
+/// 2. accumulate all residual SUI from input coins left and deposit all SUI to the first
+/// input coin, then use the first input coin as the gas coin object.
+/// 3. the balance of the first input coin after tx is sum(input_coins) - sum(amounts) - actual_gas_cost
+/// 4. all other input coints other than the first one are deleted.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+pub struct PaySui {
+    /// The coins to be used for payment.
+    pub coins: Vec<ObjectRef>,
+    /// The addresses that will receive payment
+    pub recipients: Vec<SuiAddress>,
+    /// The amounts each recipient will receive.
+    /// Must be the same length as recipients
+    pub amounts: Vec<u64>,
+}
+
+/// Pay each recipient the corresponding amount using the input coins
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+pub struct Pay {
+    /// The coins to be used for payment
+    pub coins: Vec<ObjectRef>,
+    /// The addresses that will receive payment
+    pub recipients: Vec<SuiAddress>,
+    /// The amounts each recipient will receive.
+    /// Must be the same length as recipients
+    pub amounts: Vec<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
@@ -89,18 +158,28 @@ pub struct ChangeEpoch {
     pub storage_charge: u64,
     /// The total amount of gas charged for computation during the epoch.
     pub computation_charge: u64,
+    /// The total amount of storage rebate refunded during the epoch.
+    pub storage_rebate: u64,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub enum SingleTransactionKind {
-    /// Initiate a coin transfer between addresses
-    TransferCoin(TransferCoin),
+    /// Initiate an object transfer between addresses
+    TransferObject(TransferObject),
     /// Publish a new Move module
     Publish(MoveModulePublish),
     /// Call a function in a published Move module
     Call(MoveCall),
     /// Initiate a SUI coin transfer between addresses
     TransferSui(TransferSui),
+    /// Pay multiple recipients using multiple input coins
+    Pay(Pay),
+    /// Pay multiple recipients using multiple SUI coins,
+    /// no extra gas payment SUI coin is required.
+    PaySui(PaySui),
+    /// After paying the gas of the transaction itself, pay
+    /// pay all remaining coins to the recipient.
+    PayAllSui(PayAllSui),
     /// A system transaction that will update epoch information on-chain.
     /// It will only ever be executed once in an epoch.
     /// The argument is the next epoch number, which is critical
@@ -118,15 +197,45 @@ impl SingleTransactionKind {
         self.shared_input_objects().next().is_some()
     }
 
-    pub fn shared_input_objects(&self) -> impl Iterator<Item = &ObjectID> {
+    pub fn shared_input_objects(
+        &self,
+    ) -> impl Iterator<Item = (&ObjectID, /* shared at version */ &SequenceNumber)> {
         match &self {
-            Self::Call(MoveCall { arguments, .. }) => {
-                Either::Left(arguments.iter().filter_map(|arg| match arg {
-                    CallArg::Pure(_) | CallArg::ImmOrOwnedObject(_) => None,
-                    CallArg::SharedObject(id) => Some(id),
-                }))
-            }
+            Self::Call(MoveCall { arguments, .. }) => Either::Left(
+                arguments
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        CallArg::Pure(_) | CallArg::Object(ObjectArg::ImmOrOwnedObject(_)) => None,
+                        CallArg::Object(ObjectArg::SharedObject {
+                            id,
+                            initial_shared_version,
+                        }) => Some(vec![(id, initial_shared_version)]),
+                        CallArg::ObjVec(vec) => Some(
+                            vec.iter()
+                                .filter_map(|obj_arg| {
+                                    if let ObjectArg::SharedObject {
+                                        id,
+                                        initial_shared_version,
+                                    } = obj_arg
+                                    {
+                                        Some((id, initial_shared_version))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect(),
+                        ),
+                    })
+                    .flatten(),
+            ),
             _ => Either::Right(std::iter::empty()),
+        }
+    }
+
+    pub fn move_call(&self) -> Option<&MoveCall> {
+        match &self {
+            Self::Call(call @ MoveCall { .. }) => Some(call),
+            _ => None,
         }
     }
 
@@ -136,7 +245,7 @@ impl SingleTransactionKind {
     /// TODO: use an iterator over references here instead of a Vec to avoid allocations.
     pub fn input_objects(&self) -> SuiResult<Vec<InputObjectKind>> {
         let input_objects = match &self {
-            Self::TransferCoin(TransferCoin { object_ref, .. }) => {
+            Self::TransferObject(TransferObject { object_ref, .. }) => {
                 vec![InputObjectKind::ImmOrOwnedMoveObject(*object_ref)]
             }
             Self::Call(MoveCall {
@@ -145,11 +254,42 @@ impl SingleTransactionKind {
                 .iter()
                 .filter_map(|arg| match arg {
                     CallArg::Pure(_) => None,
-                    CallArg::ImmOrOwnedObject(object_ref) => {
-                        Some(InputObjectKind::ImmOrOwnedMoveObject(*object_ref))
+                    CallArg::Object(ObjectArg::ImmOrOwnedObject(object_ref)) => {
+                        Some(vec![InputObjectKind::ImmOrOwnedMoveObject(*object_ref)])
                     }
-                    CallArg::SharedObject(id) => Some(InputObjectKind::SharedMoveObject(*id)),
+                    CallArg::Object(ObjectArg::SharedObject {
+                        id,
+                        initial_shared_version,
+                    }) => {
+                        let id = *id;
+                        let initial_shared_version = *initial_shared_version;
+                        Some(vec![InputObjectKind::SharedMoveObject {
+                            id,
+                            initial_shared_version,
+                        }])
+                    }
+                    CallArg::ObjVec(vec) => Some(
+                        vec.iter()
+                            .map(|obj_arg| match obj_arg {
+                                ObjectArg::ImmOrOwnedObject(object_ref) => {
+                                    InputObjectKind::ImmOrOwnedMoveObject(*object_ref)
+                                }
+                                ObjectArg::SharedObject {
+                                    id,
+                                    initial_shared_version,
+                                } => {
+                                    let id = *id;
+                                    let initial_shared_version = *initial_shared_version;
+                                    InputObjectKind::SharedMoveObject {
+                                        id,
+                                        initial_shared_version,
+                                    }
+                                }
+                            })
+                            .collect(),
+                    ),
                 })
+                .flatten()
                 .chain([InputObjectKind::MovePackage(package.0)])
                 .collect(),
             Self::Publish(MoveModulePublish { modules }) => {
@@ -173,10 +313,23 @@ impl SingleTransactionKind {
             Self::TransferSui(_) => {
                 vec![]
             }
+            Self::Pay(Pay { coins, .. }) => coins
+                .iter()
+                .map(|o| InputObjectKind::ImmOrOwnedMoveObject(*o))
+                .collect(),
+            Self::PaySui(PaySui { coins, .. }) => coins
+                .iter()
+                .map(|o| InputObjectKind::ImmOrOwnedMoveObject(*o))
+                .collect(),
+            Self::PayAllSui(PayAllSui { coins, .. }) => coins
+                .iter()
+                .map(|o| InputObjectKind::ImmOrOwnedMoveObject(*o))
+                .collect(),
             Self::ChangeEpoch(_) => {
-                vec![InputObjectKind::SharedMoveObject(
-                    SUI_SYSTEM_STATE_OBJECT_ID,
-                )]
+                vec![InputObjectKind::SharedMoveObject {
+                    id: SUI_SYSTEM_STATE_OBJECT_ID,
+                    initial_shared_version: SUI_SYSTEM_STATE_OBJECT_SHARED_VERSION,
+                }]
             }
         };
         // Ensure that there are no duplicate inputs. This cannot be removed because:
@@ -198,13 +351,13 @@ impl Display for SingleTransactionKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut writer = String::new();
         match &self {
-            Self::TransferCoin(t) => {
-                writeln!(writer, "Transaction Kind : Transfer Coin")?;
+            Self::TransferObject(t) => {
+                writeln!(writer, "Transaction Kind : Transfer Object")?;
                 writeln!(writer, "Recipient : {}", t.recipient)?;
                 let (object_id, seq, digest) = t.object_ref;
                 writeln!(writer, "Object ID : {}", &object_id)?;
                 writeln!(writer, "Sequence Number : {:?}", seq)?;
-                writeln!(writer, "Object Digest : {}", encode_bytes_hex(&digest.0))?;
+                writeln!(writer, "Object Digest : {}", encode_bytes_hex(digest.0))?;
             }
             Self::TransferSui(t) => {
                 writeln!(writer, "Transaction Kind : Transfer SUI")?;
@@ -214,6 +367,51 @@ impl Display for SingleTransactionKind {
                 } else {
                     writeln!(writer, "Amount: Full Balance")?;
                 }
+            }
+            Self::Pay(p) => {
+                writeln!(writer, "Transaction Kind : Pay")?;
+                writeln!(writer, "Coins:")?;
+                for (object_id, seq, digest) in &p.coins {
+                    writeln!(writer, "Object ID : {}", &object_id)?;
+                    writeln!(writer, "Sequence Number : {:?}", seq)?;
+                    writeln!(writer, "Object Digest : {}", encode_bytes_hex(digest.0))?;
+                }
+                writeln!(writer, "Recipients:")?;
+                for recipient in &p.recipients {
+                    writeln!(writer, "{}", recipient)?;
+                }
+                writeln!(writer, "Amounts:")?;
+                for amount in &p.amounts {
+                    writeln!(writer, "{}", amount)?
+                }
+            }
+            Self::PaySui(p) => {
+                writeln!(writer, "Transaction Kind : Pay SUI")?;
+                writeln!(writer, "Coins:")?;
+                for (object_id, seq, digest) in &p.coins {
+                    writeln!(writer, "Object ID : {}", &object_id)?;
+                    writeln!(writer, "Sequence Number : {:?}", seq)?;
+                    writeln!(writer, "Object Digest : {}", encode_bytes_hex(digest.0))?;
+                }
+                writeln!(writer, "Recipients:")?;
+                for recipient in &p.recipients {
+                    writeln!(writer, "{}", recipient)?;
+                }
+                writeln!(writer, "Amounts:")?;
+                for amount in &p.amounts {
+                    writeln!(writer, "{}", amount)?
+                }
+            }
+            Self::PayAllSui(p) => {
+                writeln!(writer, "Transaction Kind : Pay all SUI")?;
+                writeln!(writer, "Coins:")?;
+                for (object_id, seq, digest) in &p.coins {
+                    writeln!(writer, "Object ID : {}", &object_id)?;
+                    writeln!(writer, "Sequence Number : {:?}", seq)?;
+                    writeln!(writer, "Object Digest : {}", encode_bytes_hex(digest.0))?;
+                }
+                writeln!(writer, "Recipient:")?;
+                writeln!(writer, "{}", &p.recipient)?;
             }
             Self::Publish(_p) => {
                 writeln!(writer, "Transaction Kind : Publish")?;
@@ -231,6 +429,7 @@ impl Display for SingleTransactionKind {
                 writeln!(writer, "New epoch ID: {}", e.epoch)?;
                 writeln!(writer, "Storage gas reward: {}", e.storage_charge)?;
                 writeln!(writer, "Computation gas reward: {}", e.computation_charge)?;
+                writeln!(writer, "Storage rebate: {}", e.storage_rebate)?;
             }
         }
         write!(f, "{}", writer)
@@ -263,11 +462,41 @@ impl TransactionKind {
         }
     }
 
+    pub fn input_objects(&self) -> SuiResult<Vec<InputObjectKind>> {
+        let inputs: Vec<_> = self
+            .single_transactions()
+            .map(|s| s.input_objects())
+            .collect::<SuiResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(inputs)
+    }
+
+    pub fn shared_input_objects(
+        &self,
+    ) -> impl Iterator<Item = (&ObjectID, /* shared at version */ &SequenceNumber)> {
+        match &self {
+            TransactionKind::Single(s) => Either::Left(s.shared_input_objects()),
+            TransactionKind::Batch(b) => {
+                Either::Right(b.iter().flat_map(|kind| kind.shared_input_objects()))
+            }
+        }
+    }
+
     pub fn batch_size(&self) -> usize {
         match self {
             TransactionKind::Single(_) => 1,
             TransactionKind::Batch(batch) => batch.len(),
         }
+    }
+
+    pub fn is_pay_sui_tx(&self) -> bool {
+        matches!(
+            self,
+            TransactionKind::Single(SingleTransactionKind::PaySui(_))
+                | TransactionKind::Single(SingleTransactionKind::PayAllSui(_))
+        )
     }
 
     pub fn is_system_tx(&self) -> bool {
@@ -276,6 +505,54 @@ impl TransactionKind {
             TransactionKind::Single(SingleTransactionKind::ChangeEpoch(_))
         )
     }
+
+    pub fn is_change_epoch_tx(&self) -> bool {
+        matches!(
+            self,
+            TransactionKind::Single(SingleTransactionKind::ChangeEpoch(_))
+        )
+    }
+
+    pub fn validity_check(&self) -> SuiResult {
+        match self {
+            Self::Batch(b) => {
+                fp_ensure!(
+                    !b.is_empty(),
+                    SuiError::InvalidBatchTransaction {
+                        error: "Batch Transaction cannot be empty".to_string(),
+                    }
+                );
+                // Check that all transaction kinds can be in a batch.
+                let valid = self.single_transactions().all(|s| match s {
+                    SingleTransactionKind::Call(_)
+                    | SingleTransactionKind::TransferObject(_)
+                    | SingleTransactionKind::Pay(_) => true,
+                    SingleTransactionKind::TransferSui(_)
+                    | SingleTransactionKind::PaySui(_)
+                    | SingleTransactionKind::PayAllSui(_)
+                    | SingleTransactionKind::ChangeEpoch(_)
+                    | SingleTransactionKind::Publish(_) => false,
+                });
+                fp_ensure!(
+                    valid,
+                    SuiError::InvalidBatchTransaction {
+                        error: "Batch transaction contains non-batchable transactions. Only Call and TransferObject are allowed".to_string()
+                    }
+                );
+            }
+            Self::Single(s) => match s {
+                SingleTransactionKind::Pay(_)
+                | SingleTransactionKind::PaySui(_)
+                | SingleTransactionKind::PayAllSui(_)
+                | SingleTransactionKind::Call(_)
+                | SingleTransactionKind::Publish(_)
+                | SingleTransactionKind::TransferObject(_)
+                | SingleTransactionKind::TransferSui(_)
+                | SingleTransactionKind::ChangeEpoch(_) => (),
+            },
+        }
+        Ok(())
+    }
 }
 
 impl Display for TransactionKind {
@@ -283,7 +560,7 @@ impl Display for TransactionKind {
         let mut writer = String::new();
         match &self {
             Self::Single(s) => {
-                writeln!(writer, "{}", s)?;
+                write!(writer, "{}", s)?;
             }
             Self::Batch(b) => {
                 writeln!(writer, "Transaction Kind : Batch")?;
@@ -306,10 +583,7 @@ pub struct TransactionData {
     pub gas_budget: u64,
 }
 
-impl TransactionData
-where
-    Self: BcsSignable,
-{
+impl TransactionData {
     pub fn new(
         kind: TransactionKind,
         sender: SuiAddress,
@@ -319,6 +593,7 @@ where
         TransactionData {
             kind,
             sender,
+            // TODO: Update local-txn-data-serializer.ts if `gas_price` is changed
             gas_price: 1,
             gas_payment,
             gas_budget,
@@ -368,7 +643,7 @@ where
         gas_payment: ObjectRef,
         gas_budget: u64,
     ) -> Self {
-        let kind = TransactionKind::Single(SingleTransactionKind::TransferCoin(TransferCoin {
+        let kind = TransactionKind::Single(SingleTransactionKind::TransferObject(TransferObject {
             recipient,
             object_ref,
         }));
@@ -385,6 +660,52 @@ where
         let kind = TransactionKind::Single(SingleTransactionKind::TransferSui(TransferSui {
             recipient,
             amount,
+        }));
+        Self::new(kind, sender, gas_payment, gas_budget)
+    }
+
+    pub fn new_pay(
+        sender: SuiAddress,
+        coins: Vec<ObjectRef>,
+        recipients: Vec<SuiAddress>,
+        amounts: Vec<u64>,
+        gas_payment: ObjectRef,
+        gas_budget: u64,
+    ) -> Self {
+        let kind = TransactionKind::Single(SingleTransactionKind::Pay(Pay {
+            coins,
+            recipients,
+            amounts,
+        }));
+        Self::new(kind, sender, gas_payment, gas_budget)
+    }
+
+    pub fn new_pay_sui(
+        sender: SuiAddress,
+        coins: Vec<ObjectRef>,
+        recipients: Vec<SuiAddress>,
+        amounts: Vec<u64>,
+        gas_payment: ObjectRef,
+        gas_budget: u64,
+    ) -> Self {
+        let kind = TransactionKind::Single(SingleTransactionKind::PaySui(PaySui {
+            coins,
+            recipients,
+            amounts,
+        }));
+        Self::new(kind, sender, gas_payment, gas_budget)
+    }
+
+    pub fn new_pay_all_sui(
+        sender: SuiAddress,
+        coins: Vec<ObjectRef>,
+        recipient: SuiAddress,
+        gas_payment: ObjectRef,
+        gas_budget: u64,
+    ) -> Self {
+        let kind = TransactionKind::Single(SingleTransactionKind::PayAllSui(PayAllSui {
+            coins,
+            recipient,
         }));
         Self::new(kind, sender, gas_payment, gas_budget)
     }
@@ -421,119 +742,118 @@ where
     }
 
     pub fn to_base64(&self) -> String {
-        base64ct::Base64::encode_string(&self.to_bytes())
+        Base64::encode(&self.to_bytes())
     }
 
     pub fn gas_payment_object_ref(&self) -> &ObjectRef {
         &self.gas_payment
     }
 
+    pub fn contains_shared_object(&self) -> bool {
+        self.shared_input_objects().next().is_some()
+    }
+
+    pub fn shared_input_objects(
+        &self,
+    ) -> impl Iterator<Item = (&ObjectID, /* shared at version */ &SequenceNumber)> {
+        self.kind.shared_input_objects()
+    }
+
+    pub fn move_calls(&self) -> Vec<&MoveCall> {
+        self.kind
+            .single_transactions()
+            .flat_map(|s| s.move_call())
+            .collect()
+    }
+
     pub fn input_objects(&self) -> SuiResult<Vec<InputObjectKind>> {
-        let mut inputs = match &self.kind {
-            TransactionKind::Single(s) => s.input_objects()?,
-            TransactionKind::Batch(b) => {
-                let mut result = vec![];
-                for kind in b {
-                    fp_ensure!(
-                        !matches!(kind, &SingleTransactionKind::Publish(..)),
-                        SuiError::InvalidBatchTransaction {
-                            error: "Publish transaction is not allowed in Batch Transaction"
-                                .to_owned(),
-                        }
-                    );
-                    let sub = kind.input_objects()?;
-                    result.extend(sub);
-                }
-                result
-            }
-        };
-        if !self.kind.is_system_tx() {
+        let mut inputs = self.kind.input_objects()?;
+
+        if !self.kind.is_system_tx() && !self.kind.is_pay_sui_tx() {
             inputs.push(InputObjectKind::ImmOrOwnedMoveObject(
                 *self.gas_payment_object_ref(),
             ));
         }
         Ok(inputs)
     }
+
+    pub fn validity_check(&self) -> SuiResult {
+        match &self.kind {
+            TransactionKind::Batch(_) => (),
+            TransactionKind::Single(s) => match s {
+                SingleTransactionKind::Pay(_)
+                | SingleTransactionKind::Call(_)
+                | SingleTransactionKind::Publish(_)
+                | SingleTransactionKind::TransferObject(_)
+                | SingleTransactionKind::TransferSui(_)
+                | SingleTransactionKind::ChangeEpoch(_) => (),
+                SingleTransactionKind::PaySui(p) => {
+                    fp_ensure!(!p.coins.is_empty(), SuiError::EmptyInputCoins);
+                    fp_ensure!(
+                        // unwrap() is safe because coins are not empty.
+                        p.coins.first().unwrap() == &self.gas_payment,
+                        SuiError::UnexpectedGasPaymentObject
+                    );
+                }
+                SingleTransactionKind::PayAllSui(pa) => {
+                    fp_ensure!(!pa.coins.is_empty(), SuiError::EmptyInputCoins);
+                    fp_ensure!(
+                        // unwrap() is safe because coins are not empty.
+                        pa.coins.first().unwrap() == &self.gas_payment,
+                        SuiError::UnexpectedGasPaymentObject
+                    );
+                }
+            },
+        }
+        Ok(())
+    }
 }
 
-/// A transaction signed by a client, optionally signed by an authority (depending on `S`).
-/// `S` indicates the authority signing state. It can be either empty or signed.
-/// We make the authority signature templated so that `TransactionEnvelope<S>` can be used
-/// universally in the transactions storage in `SuiDataStore`, shared by both authorities
-/// and non-authorities: authorities store signed transactions, while non-authorities
-/// store unsigned transactions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(remote = "TransactionEnvelope")]
-pub struct TransactionEnvelope<S> {
-    // This is a cache of an otherwise expensive to compute value.
-    // DO NOT serialize or deserialize from the network or disk.
-    #[serde(skip)]
-    transaction_digest: OnceCell<TransactionDigest>,
-    // Deserialization sets this to "false"
-    // TODO: is_verified is only set to true in some callsites after verification.
-    // Hence it's not optimal.
-    #[serde(skip)]
-    pub is_verified: bool,
-
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SenderSignedData {
     pub data: TransactionData,
     /// tx_signature is signed by the transaction sender, applied on `data`.
     pub tx_signature: Signature,
-    /// authority signature information, if available, is signed by an authority, applied on `data`.
-    pub auth_sign_info: S,
-    // Note: If any new field is added here, make sure the Hash and PartialEq
-    // implementation are adjusted to include that new field (unless the new field
-    // does not participate in the hash and comparison).
 }
 
-impl<S> TransactionEnvelope<S> {
-    fn add_sender_sig_to_verification_obligation(
-        &self,
-        obligation: &mut VerificationObligation,
-    ) -> SuiResult<()> {
-        // We use this flag to see if someone has checked this before
-        // and therefore we can skip the check. Note that the flag has
-        // to be set to true manually, and is not set by calling this
-        // "check" function.
-        if self.is_verified || self.data.kind.is_system_tx() {
-            return Ok(());
-        }
+impl SenderSignedData {
+    pub fn new(data: TransactionData, tx_signature: Signature) -> Self {
+        Self { data, tx_signature }
+    }
+}
 
-        let (message, signature, public_key) = self
-            .tx_signature
-            .get_verification_inputs(&self.data, self.data.sender)?;
-        let idx = obligation.add_message(message);
-        let key = obligation.lookup_public_key(&public_key)?;
-        obligation.public_keys.push(key);
-        obligation.signatures.push(signature);
-        obligation.message_index.push(idx);
-        Ok(())
+impl Message for SenderSignedData {
+    type DigestType = TransactionDigest;
+
+    fn digest(&self) -> Self::DigestType {
+        TransactionDigest::new(sha3_hash(self))
     }
 
+    fn verify(&self) -> SuiResult {
+        if self.data.kind.is_system_tx() {
+            return Ok(());
+        }
+        self.tx_signature.verify(&self.data, self.data.sender)
+    }
+}
+
+impl<S> Envelope<SenderSignedData, S> {
     pub fn sender_address(&self) -> SuiAddress {
-        self.data.sender
+        self.data().data.sender
     }
 
     pub fn gas_payment_object_ref(&self) -> &ObjectRef {
-        self.data.gas_payment_object_ref()
+        self.data().data.gas_payment_object_ref()
     }
 
     pub fn contains_shared_object(&self) -> bool {
         self.shared_input_objects().next().is_some()
     }
 
-    pub fn shared_input_objects(&self) -> impl Iterator<Item = &ObjectID> {
-        match &self.data.kind {
-            TransactionKind::Single(s) => Either::Left(s.shared_input_objects()),
-            TransactionKind::Batch(b) => {
-                Either::Right(b.iter().flat_map(|kind| kind.shared_input_objects()))
-            }
-        }
-    }
-
-    /// Get the transaction digest and write it to the cache
-    pub fn digest(&self) -> &TransactionDigest {
-        self.transaction_digest
-            .get_or_init(|| TransactionDigest::new(sha3_hash(&self.data)))
+    pub fn shared_input_objects(
+        &self,
+    ) -> impl Iterator<Item = (&ObjectID, /* shared at version */ &SequenceNumber)> {
+        self.data().data.kind.shared_input_objects()
     }
 
     pub fn input_objects_in_compiled_modules(
@@ -557,114 +877,65 @@ impl<S> TransactionEnvelope<S> {
             .map(InputObjectKind::MovePackage)
             .collect::<Vec<_>>()
     }
-}
 
-// In combination with #[serde(remote = "TransactionEnvelope")].
-// Generic types instantiated multiple times in the same tracing session requires a work around.
-// https://novifinancial.github.io/serde-reflection/serde_reflection/index.html#features-and-limitations
-impl<'de, T> Deserialize<'de> for TransactionEnvelope<T>
-where
-    T: Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        TransactionEnvelope::deserialize(DeserializeNameAdapter::new(
-            deserializer,
-            // TODO: This generates a very long name that includes the namespace and modules.
-            // Ideally we just want TransactionEnvelope<T> with T substituted as the name.
-            // https://github.com/MystenLabs/sui/issues/1119
-            std::any::type_name::<TransactionEnvelope<T>>(),
-        ))
+    pub fn is_system_tx(&self) -> bool {
+        self.data().data.kind.is_system_tx()
     }
 }
 
-impl<T> Serialize for TransactionEnvelope<T>
-where
-    T: Serialize,
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        TransactionEnvelope::serialize(
-            self,
-            SerializeNameAdapter::new(serializer, std::any::type_name::<TransactionEnvelope<T>>()),
+/// A transaction that is signed by a sender but not yet by an authority.
+pub type Transaction = Envelope<SenderSignedData, EmptySignInfo>;
+pub type VerifiedTransaction = VerifiedEnvelope<SenderSignedData, EmptySignInfo>;
+
+impl Transaction {
+    pub fn from_data(data: TransactionData, signature: Signature) -> Self {
+        Self::new(SenderSignedData::new(data, signature))
+    }
+
+    #[cfg(test)]
+    pub fn from_data_and_signer(
+        data: TransactionData,
+        signer: &dyn signature::Signer<Signature>,
+    ) -> Self {
+        let signature = Signature::new(&data, signer);
+        Self::from_data(data, signature)
+    }
+
+    pub fn to_network_data_for_execution(&self) -> (Base64, SignatureScheme, Base64, Base64) {
+        (
+            Base64::from_bytes(&self.data().data.to_bytes()),
+            self.data().tx_signature.scheme(),
+            Base64::from_bytes(self.data().tx_signature.signature_bytes()),
+            Base64::from_bytes(self.data().tx_signature.public_key_bytes()),
         )
     }
 }
 
-// TODO: this should maybe be called ClientSignedTransaction + SignedTransaction -> AuthoritySignedTransaction
-/// A transaction that is signed by a sender but not yet by an authority.
-pub type Transaction = TransactionEnvelope<EmptySignInfo>;
-
-impl Transaction {
-    #[cfg(test)]
-    pub fn from_data(data: TransactionData, signer: &dyn signature::Signer<Signature>) -> Self {
-        let signature = Signature::new(&data, signer);
-        Self::new(data, signature)
-    }
-
-    pub fn new(data: TransactionData, signature: Signature) -> Self {
-        Self {
-            transaction_digest: OnceCell::new(),
-            is_verified: false,
-            data,
-            tx_signature: signature,
-            auth_sign_info: EmptySignInfo {},
-        }
-    }
-
-    pub fn verify(&self) -> Result<(), SuiError> {
-        let mut obligation = VerificationObligation::default();
-        self.add_sender_sig_to_verification_obligation(&mut obligation)?;
-        obligation.verify_all().map(|_| ())
-    }
-}
-
-impl Hash for Transaction {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.data.hash(state);
-    }
-}
-
-impl PartialEq for Transaction {
-    fn eq(&self, other: &Self) -> bool {
-        self.data == other.data
-    }
-}
-impl Eq for Transaction {}
-
 /// A transaction that is signed by a sender and also by an authority.
-pub type SignedTransaction = TransactionEnvelope<AuthoritySignInfo>;
+pub type SignedTransaction = Envelope<SenderSignedData, AuthoritySignInfo>;
+pub type VerifiedSignedTransaction = VerifiedEnvelope<SenderSignedData, AuthoritySignInfo>;
 
-impl SignedTransaction {
+impl VerifiedSignedTransaction {
     /// Use signing key to create a signed object.
     pub fn new(
         epoch: EpochId,
-        transaction: Transaction,
+        transaction: VerifiedTransaction,
         authority: AuthorityName,
         secret: &dyn signature::Signer<AuthoritySignature>,
     ) -> Self {
-        let signature = AuthoritySignature::new(&transaction.data, secret);
-        Self {
-            transaction_digest: OnceCell::new(),
-            is_verified: transaction.is_verified,
-            data: transaction.data,
-            tx_signature: transaction.tx_signature,
-            auth_sign_info: AuthoritySignInfo {
-                epoch,
-                authority,
-                signature,
-            },
-        }
+        Self::new_from_verified(SignedTransaction::new(
+            epoch,
+            transaction.into_inner().into_data(),
+            secret,
+            authority,
+        ))
     }
 
     pub fn new_change_epoch(
         next_epoch: EpochId,
         storage_charge: u64,
         computation_charge: u64,
+        storage_rebate: u64,
         authority: AuthorityName,
         secret: &dyn signature::Signer<AuthoritySignature>,
     ) -> Self {
@@ -672,6 +943,7 @@ impl SignedTransaction {
             epoch: next_epoch,
             storage_charge,
             computation_charge,
+            storage_rebate,
         }));
         // For the ChangeEpoch transaction, we do not care about the sender and the gas.
         let data = TransactionData::new(
@@ -680,65 +952,27 @@ impl SignedTransaction {
             (ObjectID::ZERO, SequenceNumber::default(), ObjectDigest::MIN),
             0,
         );
-        let signature = AuthoritySignature::new(&data, secret);
-        Self {
-            transaction_digest: OnceCell::new(),
-            is_verified: false,
+        let signed_data = SenderSignedData {
             data,
-            tx_signature: Signature::new_empty(),
-            auth_sign_info: AuthoritySignInfo {
-                epoch: next_epoch,
-                authority,
-                signature,
-            },
-        }
-    }
-
-    /// Verify the signature and return the non-zero voting right of the authority.
-    pub fn verify(&self, committee: &Committee) -> Result<u64, SuiError> {
-        let mut obligation = VerificationObligation::default();
-        self.add_sender_sig_to_verification_obligation(&mut obligation)?;
-        let weight = committee.weight(&self.auth_sign_info.authority);
-        fp_ensure!(weight > 0, SuiError::UnknownSigner);
-        let mut message = Vec::new();
-        self.data.write(&mut message);
-        let idx = obligation.add_message(message);
-        self.auth_sign_info
-            .add_to_verification_obligation(committee, &mut obligation, idx)?;
-
-        obligation.verify_all()?;
-        Ok(weight)
-    }
-
-    // Turn a SignedTransaction into a Transaction. This is needed when we are
-    // forming a CertifiedTransaction, where each transaction's authority signature
-    // is taking out to form an aggregated signature.
-    pub fn to_transaction(self) -> Transaction {
-        Transaction::new(self.data, self.tx_signature)
+            // Arbitrary keypair
+            tx_signature: Ed25519SuiSignature::from_bytes(&[0; Ed25519SuiSignature::LENGTH])
+                .unwrap()
+                .into(),
+        };
+        Self::new_from_verified(SignedTransaction::new(
+            next_epoch,
+            signed_data,
+            secret,
+            authority,
+        ))
     }
 }
 
-impl Hash for SignedTransaction {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.data.hash(state);
-        self.auth_sign_info.hash(state);
-    }
-}
+pub type CertifiedTransaction = Envelope<SenderSignedData, AuthorityStrongQuorumSignInfo>;
+pub type TxCertAndSignedEffects = (CertifiedTransaction, SignedTransactionEffects);
 
-impl PartialEq for SignedTransaction {
-    fn eq(&self, other: &Self) -> bool {
-        // We do not compare the tx_signature, because there can be multiple
-        // valid signatures for the same data and signer.
-        self.data == other.data && self.auth_sign_info == other.auth_sign_info
-    }
-}
-
-pub type CertifiedTransaction = TransactionEnvelope<AuthorityQuorumSignInfo>;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ConfirmationTransaction {
-    pub certificate: CertifiedTransaction,
-}
+pub type VerifiedCertificate = VerifiedEnvelope<SenderSignedData, AuthorityStrongQuorumSignInfo>;
+pub type TrustedCertificate = TrustedEnvelope<SenderSignedData, AuthorityStrongQuorumSignInfo>;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct AccountInfoRequest {
@@ -762,6 +996,33 @@ pub struct BatchInfoRequest {
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct BatchInfoResponseItem(pub UpdateItem);
 
+/// Subscribe to notifications when new checkpoint certificates are available.
+///
+/// Note that there is no start field necessary, because checkpoint sequence numbers are
+/// contiguous. Therefore the client is always immediately sent the highest available checkpoint
+/// number, from which they can deduce if they are missing any checkpoints.
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointStreamRequest {
+    // No request fields are currently necessary, but tonic errors when the request struct has size
+    // 0.
+    _ignored: u64,
+}
+
+impl CheckpointStreamRequest {
+    pub fn new() -> Self {
+        Default::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointStreamResponseItem {
+    /// The first available checkpoint sequence on this validator. Currently this is always 0.
+    /// When snapshots are implemented, this may change to become the first checkpoint after the
+    /// most recent snapshot.
+    pub first_available_sequence: CheckpointSequenceNumber,
+    pub checkpoint: AuthenticatedCheckpoint,
+}
+
 impl From<SuiAddress> for AccountInfoRequest {
     fn from(account: SuiAddress) -> Self {
         AccountInfoRequest { account }
@@ -775,6 +1036,11 @@ pub enum ObjectInfoRequestKind {
     LatestObjectInfo(Option<ObjectFormatOptions>),
     /// Request the object state at a specific version
     PastObjectInfo(SequenceNumber),
+    /// Similar to PastObjectInfo, except that it will also return the object content.
+    /// This is used only for debugging purpose and will not work in the long run when
+    /// we stop storing all historic versions of every object.
+    /// No production code should depend on this kind.
+    PastObjectInfoDebug(SequenceNumber, Option<ObjectFormatOptions>),
 }
 
 /// A request for information about an object and optionally its
@@ -813,40 +1079,74 @@ pub struct AccountInfoResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjectResponse {
+pub struct ObjectResponse<T = SignedTransaction> {
     /// Value of the requested object in this authority
     pub object: Object,
     /// Transaction the object is locked on in this authority.
     /// None if the object is not currently locked by this authority.
-    pub lock: Option<SignedTransaction>,
+    pub lock: Option<T>,
     /// Schema of the Move value inside this object.
     /// None if the object is a Move package, or the request did not ask for the layout
     pub layout: Option<MoveStructLayout>,
 }
 
+impl From<ObjectResponse<VerifiedSignedTransaction>> for ObjectResponse {
+    fn from(o: ObjectResponse<VerifiedSignedTransaction>) -> Self {
+        let ObjectResponse {
+            object,
+            lock,
+            layout,
+        } = o;
+
+        Self {
+            object,
+            lock: lock.map(|l| l.into()),
+            layout,
+        }
+    }
+}
+
 /// This message provides information about the latest object and its lock
 /// as well as the parent certificate of the object at a specific version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjectInfoResponse {
+pub struct ObjectInfoResponse<TxnT = SignedTransaction, CertT = CertifiedTransaction> {
     /// The certificate that created or mutated the object at a given version.
     /// If no parent certificate was requested the latest certificate concerning
     /// this object is sent. If the parent was requested and not found a error
     /// (ParentNotfound or CertificateNotfound) will be returned.
-    pub parent_certificate: Option<CertifiedTransaction>,
+    pub parent_certificate: Option<CertT>,
     /// The full reference created by the above certificate
     pub requested_object_reference: Option<ObjectRef>,
 
     /// The object and its current lock, returned only if we are requesting
     /// the latest state of an object.
     /// If the object does not exist this is also None.
-    pub object_and_lock: Option<ObjectResponse>,
+    pub object_and_lock: Option<ObjectResponse<TxnT>>,
 }
+
+pub type VerifiedObjectInfoResponse =
+    ObjectInfoResponse<VerifiedSignedTransaction, VerifiedCertificate>;
 
 impl ObjectInfoResponse {
     pub fn object(&self) -> Option<&Object> {
         match &self.object_and_lock {
             Some(ObjectResponse { object, .. }) => Some(object),
             _ => None,
+        }
+    }
+}
+
+impl From<VerifiedObjectInfoResponse> for ObjectInfoResponse {
+    fn from(o: VerifiedObjectInfoResponse) -> Self {
+        let ObjectInfoResponse {
+            parent_certificate,
+            requested_object_reference,
+            object_and_lock,
+        } = o;
+        Self {
+            parent_certificate: parent_certificate.map(|p| p.into()),
+            requested_object_reference,
+            object_and_lock: object_and_lock.map(|o| o.into()),
         }
     }
 }
@@ -863,14 +1163,35 @@ impl From<TransactionDigest> for TransactionInfoRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TransactionInfoResponse {
+pub struct TransactionInfoResponse<TxnT = SignedTransaction, CertT = CertifiedTransaction> {
     // The signed transaction response to handle_transaction
-    pub signed_transaction: Option<SignedTransaction>,
+    pub signed_transaction: Option<TxnT>,
     // The certificate in case one is available
-    pub certified_transaction: Option<CertifiedTransaction>,
+    pub certified_transaction: Option<CertT>,
     // The effects resulting from a successful execution should
     // contain ObjectRef created, mutated, deleted and events.
     pub signed_effects: Option<SignedTransactionEffects>,
+}
+
+pub type VerifiedTransactionInfoResponse =
+    TransactionInfoResponse<VerifiedSignedTransaction, VerifiedCertificate>;
+
+impl From<VerifiedTransactionInfoResponse> for TransactionInfoResponse {
+    fn from(v: VerifiedTransactionInfoResponse) -> Self {
+        let VerifiedTransactionInfoResponse {
+            signed_transaction,
+            certified_transaction,
+            signed_effects,
+        } = v;
+
+        let certified_transaction = certified_transaction.map(|c| c.into_inner());
+        let signed_transaction = signed_transaction.map(|c| c.into_inner());
+        TransactionInfoResponse {
+            signed_transaction,
+            certified_transaction,
+            signed_effects,
+        }
+    }
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
@@ -897,23 +1218,347 @@ pub enum CallResult {
 
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub enum ExecutionStatus {
-    // Gas used in the success case.
-    Success {
-        gas_cost: GasCostSummary,
-    },
+    Success,
     // Gas used in the failed case, and the error.
-    Failure {
-        gas_cost: GasCostSummary,
-        error: Box<SuiError>,
-    },
+    Failure { error: ExecutionFailureStatus },
 }
 
-impl ExecutionStatus {
-    pub fn new_failure(gas_used: GasCostSummary, error: SuiError) -> ExecutionStatus {
-        ExecutionStatus::Failure {
-            gas_cost: gas_used,
-            error: Box::new(error),
+#[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
+pub enum ExecutionFailureStatus {
+    //
+    // General transaction errors
+    //
+    InsufficientGas,
+    InvalidGasObject,
+    InvalidTransactionUpdate,
+    ModuleNotFound,
+    FunctionNotFound,
+    InvariantViolation,
+
+    //
+    // Transfer errors
+    //
+    InvalidTransferObject,
+    InvalidTransferSui,
+    InvalidTransferSuiInsufficientBalance,
+    InvalidCoinObject,
+
+    //
+    // Pay errors
+    //
+    /// Supplied 0 input coins
+    EmptyInputCoins,
+    /// Supplied an empty list of recipient addresses for the payment
+    EmptyRecipients,
+    /// Supplied a different number of recipient addresses and recipient amounts
+    RecipientsAmountsArityMismatch,
+    /// Not enough funds to perform the requested payment
+    InsufficientBalance,
+    /// Coin type check failed in pay/pay_sui/pay_all_sui transaction.
+    /// In pay transaction, it means the input coins' types are not the same;
+    /// In PaySui/PayAllSui, it means some input coins are not SUI coins.
+    CoinTypeMismatch,
+
+    //
+    // MoveCall errors
+    //
+    NonEntryFunctionInvoked,
+    EntryTypeArityMismatch,
+    EntryArgumentError(EntryArgumentError),
+    CircularObjectOwnership(CircularObjectOwnership),
+    InvalidChildObjectArgument(InvalidChildObjectArgument),
+    InvalidSharedByValue(InvalidSharedByValue),
+    TooManyChildObjects {
+        object: ObjectID,
+    },
+    InvalidParentDeletion {
+        parent: ObjectID,
+        kind: Option<DeleteKind>,
+    },
+    InvalidParentFreezing {
+        parent: ObjectID,
+    },
+
+    //
+    // MovePublish errors
+    //
+    PublishErrorEmptyPackage,
+    PublishErrorNonZeroAddress,
+    PublishErrorDuplicateModule,
+    SuiMoveVerificationError,
+
+    //
+    // Errors from the Move VM
+    //
+    // TODO module id + func def + offset?
+    MovePrimitiveRuntimeError,
+    /// Indicates and `abort` from inside Move code. Contains the location of the abort and the
+    /// abort code
+    MoveAbort(ModuleId, u64), // TODO func def + offset?
+    VMVerificationOrDeserializationError,
+    VMInvariantViolation,
+}
+
+#[derive(Eq, PartialEq, Clone, Copy, Debug, Serialize, Deserialize, Hash)]
+pub struct EntryArgumentError {
+    pub argument_idx: LocalIndex,
+    pub kind: EntryArgumentErrorKind,
+}
+
+#[derive(Eq, PartialEq, Clone, Copy, Debug, Serialize, Deserialize, Hash)]
+pub enum EntryArgumentErrorKind {
+    TypeMismatch,
+    InvalidObjectByValue,
+    InvalidObjectByMuteRef,
+    ObjectKindMismatch,
+    UnsupportedPureArg,
+    ArityMismatch,
+}
+
+#[derive(Eq, PartialEq, Clone, Copy, Debug, Serialize, Deserialize, Hash)]
+pub struct CircularObjectOwnership {
+    pub object: ObjectID,
+}
+
+#[derive(Eq, PartialEq, Clone, Copy, Debug, Serialize, Deserialize, Hash)]
+pub struct InvalidChildObjectArgument {
+    pub child: ObjectID,
+    pub parent: SuiAddress,
+}
+
+#[derive(Eq, PartialEq, Clone, Copy, Debug, Serialize, Deserialize, Hash)]
+pub struct InvalidSharedByValue {
+    pub object: ObjectID,
+}
+
+impl ExecutionFailureStatus {
+    pub fn entry_argument_error(argument_idx: LocalIndex, kind: EntryArgumentErrorKind) -> Self {
+        EntryArgumentError { argument_idx, kind }.into()
+    }
+
+    pub fn circular_object_ownership(object: ObjectID) -> Self {
+        CircularObjectOwnership { object }.into()
+    }
+
+    pub fn invalid_child_object_argument(child: ObjectID, parent: SuiAddress) -> Self {
+        InvalidChildObjectArgument { child, parent }.into()
+    }
+
+    pub fn invalid_shared_by_value(object: ObjectID) -> Self {
+        InvalidSharedByValue { object }.into()
+    }
+}
+
+impl Display for ExecutionFailureStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutionFailureStatus::CoinTypeMismatch => {
+                write!(
+                    f,
+                    "Coin type check failed in pay/pay_sui/pay_all_sui transaction"
+                )
+            }
+            ExecutionFailureStatus::EmptyInputCoins => {
+                write!(f, "Expected a non-empty list of input Coin objects")
+            }
+            ExecutionFailureStatus::EmptyRecipients => {
+                write!(f, "Expected a non-empty list of recipient addresses")
+            }
+            ExecutionFailureStatus::InsufficientBalance => write!(
+                f,
+                "Value of input coins is insufficient to cover outgoing amounts"
+            ),
+            ExecutionFailureStatus::InsufficientGas => write!(f, "Insufficient Gas."),
+            ExecutionFailureStatus::InvalidGasObject => {
+                write!(
+                    f,
+                    "Invalid Gas Object. Possibly not address-owned or possibly not a SUI coin."
+                )
+            }
+            ExecutionFailureStatus::InvalidTransactionUpdate => {
+                write!(f, "Invalid Transaction Update.")
+            }
+            ExecutionFailureStatus::ModuleNotFound => write!(f, "Module Not Found."),
+            ExecutionFailureStatus::FunctionNotFound => write!(f, "Function Not Found."),
+            ExecutionFailureStatus::InvariantViolation => write!(f, "INVARIANT VIOLATION."),
+            ExecutionFailureStatus::InvalidTransferObject => write!(
+                f,
+                "Invalid Transfer Object Transaction. \
+                Possibly not address-owned or possibly does not have public transfer."
+            ),
+            ExecutionFailureStatus::InvalidCoinObject => {
+                write!(f, "Invalid coin::Coin object bytes.")
+            }
+            ExecutionFailureStatus::InvalidTransferSui => write!(
+                f,
+                "Invalid Transfer SUI. \
+                Possibly not address-owned or possibly not a SUI coin."
+            ),
+            ExecutionFailureStatus::InvalidTransferSuiInsufficientBalance => {
+                write!(f, "Invalid Transfer SUI, Insufficient Balance.")
+            }
+            ExecutionFailureStatus::NonEntryFunctionInvoked => write!(
+                f,
+                "Non Entry Function Invoked. Move Call must start with an entry function"
+            ),
+            ExecutionFailureStatus::EntryTypeArityMismatch => write!(
+                f,
+                "Number of type arguments does not match the expected value",
+            ),
+            ExecutionFailureStatus::EntryArgumentError(data) => {
+                write!(f, "Entry Argument Type Error. {data}")
+            }
+            ExecutionFailureStatus::CircularObjectOwnership(data) => {
+                write!(f, "Circular  Object Ownership. {data}")
+            }
+            ExecutionFailureStatus::InvalidChildObjectArgument(data) => {
+                write!(f, "Invalid Object Owned Argument. {data}")
+            }
+            ExecutionFailureStatus::InvalidSharedByValue(data) => {
+                write!(f, "Invalid Shared Object By-Value Usage. {data}.")
+            }
+            ExecutionFailureStatus::RecipientsAmountsArityMismatch => write!(
+                f,
+                "Expected recipient and amounts lists to be the same length"
+            ),
+            ExecutionFailureStatus::TooManyChildObjects { object } => {
+                write!(
+                    f,
+                    "Object {object} has too many child objects. \
+                    The number of child objects cannot exceed 2^32 - 1."
+                )
+            }
+            ExecutionFailureStatus::InvalidParentDeletion { parent, kind } => {
+                let method = match kind {
+                    Some(DeleteKind::Normal) => "deleted",
+                    Some(DeleteKind::UnwrapThenDelete) => "unwrapped then deleted",
+                    Some(DeleteKind::Wrap) => "wrapped in another object",
+                    None => "created and destroyed",
+                };
+                write!(
+                    f,
+                    "Invalid Deletion of Parent Object with Children. Parent object {parent} was \
+                    {method} before its children were deleted or transferred."
+                )
+            }
+            ExecutionFailureStatus::InvalidParentFreezing { parent } => {
+                write!(
+                    f,
+                    "Invalid Freezing of Parent Object with Children. Parent object {parent} was \
+                    made immutable before its children were deleted or transferred."
+                )
+            }
+            ExecutionFailureStatus::PublishErrorEmptyPackage => write!(
+                f,
+                "Publish Error, Empty Package. A package must have at least one module."
+            ),
+            ExecutionFailureStatus::PublishErrorNonZeroAddress => write!(
+                f,
+                "Publish Error, Non-zero Address. \
+                The modules in the package must have their address set to zero."
+            ),
+            ExecutionFailureStatus::PublishErrorDuplicateModule => write!(
+                f,
+                "Publish Error, Duplicate Module. More than one module with a given name."
+            ),
+            ExecutionFailureStatus::SuiMoveVerificationError => write!(
+                f,
+                "Sui Move Bytecode Verification Error. \
+                Please run the Sui Move Verifier for more information."
+            ),
+            ExecutionFailureStatus::MovePrimitiveRuntimeError => write!(
+                f,
+                "Move Primitive Runtime Error. \
+                Arithmetic error, stack overflow, max value depth, etc."
+            ),
+            ExecutionFailureStatus::MoveAbort(m, c) => {
+                write!(f, "Move Runtime Abort. Module: {}, Status Code: {}", m, c)
+            }
+            ExecutionFailureStatus::VMVerificationOrDeserializationError => write!(
+                f,
+                "Move Bytecode Verification Error. \
+                Please run the Bytecode Verifier for more information."
+            ),
+            ExecutionFailureStatus::VMInvariantViolation => {
+                write!(f, "MOVE VM INVARIANT VIOLATION.")
+            }
         }
+    }
+}
+
+impl Display for EntryArgumentError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let EntryArgumentError { argument_idx, kind } = self;
+        write!(f, "Error for argument at index {argument_idx}: {kind}",)
+    }
+}
+
+impl Display for EntryArgumentErrorKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryArgumentErrorKind::TypeMismatch => write!(f, "Type mismatch."),
+            EntryArgumentErrorKind::InvalidObjectByValue => {
+                write!(f, "Immutable and shared objects cannot be passed by-value.")
+            }
+            EntryArgumentErrorKind::InvalidObjectByMuteRef => {
+                write!(
+                    f,
+                    "Immutable objects cannot be passed by mutable reference, &mut."
+                )
+            }
+            EntryArgumentErrorKind::ObjectKindMismatch => {
+                write!(f, "Mismtach with object argument kind and its actual kind.")
+            }
+            EntryArgumentErrorKind::UnsupportedPureArg => write!(
+                f,
+                "Unsupported non-object argument; if it is an object, it must be \
+                populated by an object ID."
+            ),
+            EntryArgumentErrorKind::ArityMismatch => {
+                write!(
+                    f,
+                    "Mismatch between the number of actual versus expected argument."
+                )
+            }
+        }
+    }
+}
+
+impl Display for CircularObjectOwnership {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let CircularObjectOwnership { object } = self;
+        write!(f, "Circular object ownership, including object {object}.")
+    }
+}
+
+impl Display for InvalidChildObjectArgument {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let InvalidChildObjectArgument { child, parent } = self;
+        write!(
+            f,
+            "Object {child} is owned by object {parent}. \
+            Objects owned by other objects cannot be used as input arguments."
+        )
+    }
+}
+
+impl Display for InvalidSharedByValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let InvalidSharedByValue { object } = self;
+        write!(
+            f,
+        "When a shared object is passed as an owned Move value in an entry function, either the \
+        the shared object's type must be defined in the same module as the called function. The \
+        shared object {object} is not defined in this module",
+        )
+    }
+}
+
+impl std::error::Error for ExecutionFailureStatus {}
+
+impl ExecutionStatus {
+    pub fn new_failure(error: ExecutionFailureStatus) -> ExecutionStatus {
+        ExecutionStatus::Failure { error }
     }
 
     pub fn is_ok(&self) -> bool {
@@ -924,37 +1569,46 @@ impl ExecutionStatus {
         matches!(self, ExecutionStatus::Failure { .. })
     }
 
-    pub fn unwrap(self) -> GasCostSummary {
+    pub fn unwrap(self) {
         match self {
-            ExecutionStatus::Success { gas_cost: gas_used } => gas_used,
+            ExecutionStatus::Success => {}
             ExecutionStatus::Failure { .. } => {
                 panic!("Unable to unwrap() on {:?}", self);
             }
         }
     }
 
-    pub fn unwrap_err(self) -> (GasCostSummary, SuiError) {
+    pub fn unwrap_err(self) -> ExecutionFailureStatus {
         match self {
             ExecutionStatus::Success { .. } => {
                 panic!("Unable to unwrap() on {:?}", self);
             }
-            ExecutionStatus::Failure {
-                gas_cost: gas_used,
-                error,
-            } => (gas_used, *error),
+            ExecutionStatus::Failure { error } => error,
         }
     }
+}
 
-    /// Returns the gas used from the status
-    pub fn gas_cost_summary(&self) -> &GasCostSummary {
-        match &self {
-            ExecutionStatus::Success {
-                gas_cost: gas_used, ..
-            } => gas_used,
-            ExecutionStatus::Failure {
-                gas_cost: gas_used, ..
-            } => gas_used,
-        }
+impl From<EntryArgumentError> for ExecutionFailureStatus {
+    fn from(error: EntryArgumentError) -> Self {
+        Self::EntryArgumentError(error)
+    }
+}
+
+impl From<CircularObjectOwnership> for ExecutionFailureStatus {
+    fn from(error: CircularObjectOwnership) -> Self {
+        Self::CircularObjectOwnership(error)
+    }
+}
+
+impl From<InvalidChildObjectArgument> for ExecutionFailureStatus {
+    fn from(error: InvalidChildObjectArgument) -> Self {
+        Self::InvalidChildObjectArgument(error)
+    }
+}
+
+impl From<InvalidSharedByValue> for ExecutionFailureStatus {
+    fn from(error: InvalidSharedByValue) -> Self {
+        Self::InvalidSharedByValue(error)
     }
 }
 
@@ -963,6 +1617,7 @@ impl ExecutionStatus {
 pub struct TransactionEffects {
     // The status of the execution
     pub status: ExecutionStatus,
+    pub gas_used: GasCostSummary,
     // The object references of the shared objects used in this transaction. Empty if no shared objects were used.
     pub shared_objects: Vec<ObjectRef>,
     // The transaction digest
@@ -989,11 +1644,27 @@ pub struct TransactionEffects {
 }
 
 impl TransactionEffects {
-    /// Return an iterator that iterates through both mutated and
-    /// created objects.
-    /// It doesn't include deleted objects.
-    pub fn mutated_and_created(&self) -> impl Iterator<Item = &(ObjectRef, Owner)> + Clone {
-        self.mutated.iter().chain(self.created.iter())
+    /// Return an iterator that iterates through all mutated objects, including mutated,
+    /// created and unwrapped objects. In other words, all objects that still exist
+    /// in the object state after this transaction.
+    /// It doesn't include deleted/wrapped objects.
+    pub fn all_mutated(&self) -> impl Iterator<Item = (&ObjectRef, &Owner, WriteKind)> + Clone {
+        self.mutated
+            .iter()
+            .map(|(r, o)| (r, o, WriteKind::Mutate))
+            .chain(self.created.iter().map(|(r, o)| (r, o, WriteKind::Create)))
+            .chain(
+                self.unwrapped
+                    .iter()
+                    .map(|(r, o)| (r, o, WriteKind::Unwrap)),
+            )
+    }
+
+    pub fn execution_digests(&self) -> ExecutionDigests {
+        ExecutionDigests {
+            transaction: self.transaction_digest,
+            effects: self.digest(),
+        }
     }
 
     /// Return an iterator of mutated objects, but excluding the gas object.
@@ -1001,32 +1672,8 @@ impl TransactionEffects {
         self.mutated.iter().filter(|o| *o != &self.gas_object)
     }
 
-    pub fn is_object_mutated_here(&self, obj_ref: ObjectRef) -> bool {
-        // The mutated or created case
-        if self.mutated_and_created().any(|(oref, _)| *oref == obj_ref) {
-            return true;
-        }
-
-        // The deleted case
-        if obj_ref.2 == ObjectDigest::OBJECT_DIGEST_DELETED
-            && self
-                .deleted
-                .iter()
-                .any(|(id, seq, _)| *id == obj_ref.0 && seq.increment() == obj_ref.1)
-        {
-            return true;
-        }
-
-        // The wrapped case
-        if obj_ref.2 == ObjectDigest::OBJECT_DIGEST_WRAPPED
-            && self
-                .wrapped
-                .iter()
-                .any(|(id, seq, _)| *id == obj_ref.0 && seq.increment() == obj_ref.1)
-        {
-            return true;
-        }
-        false
+    pub fn gas_cost_summary(&self) -> &GasCostSummary {
+        &self.gas_used
     }
 
     pub fn to_sign_effects(
@@ -1035,15 +1682,12 @@ impl TransactionEffects {
         authority_name: &AuthorityName,
         secret: &dyn signature::Signer<AuthoritySignature>,
     ) -> SignedTransactionEffects {
-        let signature = AuthoritySignature::new(&self, secret);
-
+        let transaction_effects_digest = OnceCell::from(self.digest());
+        let auth_signature = AuthoritySignInfo::new(epoch, &self, *authority_name, secret);
         SignedTransactionEffects {
+            transaction_effects_digest,
             effects: self,
-            auth_signature: AuthoritySignInfo {
-                epoch,
-                authority: *authority_name,
-                signature,
-            },
+            auth_signature,
         }
     }
 
@@ -1051,8 +1695,6 @@ impl TransactionEffects {
         TransactionEffectsDigest(sha3_hash(self))
     }
 }
-
-impl BcsSignable for TransactionEffects {}
 
 impl Display for TransactionEffects {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -1092,18 +1734,60 @@ impl Display for TransactionEffects {
     }
 }
 
+impl Default for TransactionEffects {
+    fn default() -> Self {
+        TransactionEffects {
+            status: ExecutionStatus::Success,
+            gas_used: GasCostSummary {
+                computation_cost: 0,
+                storage_cost: 0,
+                storage_rebate: 0,
+            },
+            shared_objects: Vec::new(),
+            transaction_digest: TransactionDigest::random(),
+            created: Vec::new(),
+            mutated: Vec::new(),
+            unwrapped: Vec::new(),
+            deleted: Vec::new(),
+            wrapped: Vec::new(),
+            gas_object: (
+                (
+                    ObjectID::random(),
+                    SequenceNumber::new(),
+                    ObjectDigest::new([0; 32]),
+                ),
+                Owner::AddressOwner(SuiAddress::default()),
+            ),
+            events: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactionEffectsEnvelope<S> {
+    // This is a cache of an otherwise expensive to compute value.
+    // DO NOT serialize or deserialize from the network or disk.
+    #[serde(skip)]
+    transaction_effects_digest: OnceCell<TransactionEffectsDigest>,
+
     pub effects: TransactionEffects,
     pub auth_signature: S,
+}
+
+impl<S> TransactionEffectsEnvelope<S> {
+    pub fn digest(&self) -> &TransactionEffectsDigest {
+        self.transaction_effects_digest
+            .get_or_init(|| self.effects.digest())
+    }
 }
 
 pub type UnsignedTransactionEffects = TransactionEffectsEnvelope<EmptySignInfo>;
 pub type SignedTransactionEffects = TransactionEffectsEnvelope<AuthoritySignInfo>;
 
 impl SignedTransactionEffects {
-    pub fn digest(&self) -> [u8; 32] {
-        sha3_hash(&self.effects)
+    pub fn verify(&self, committee: &Committee) -> SuiResult {
+        self.auth_signature.verify(&self.effects, committee)
     }
 }
 
@@ -1113,22 +1797,26 @@ impl PartialEq for SignedTransactionEffects {
     }
 }
 
-pub type CertifiedTransactionEffects = TransactionEffectsEnvelope<AuthorityQuorumSignInfo>;
+pub type CertifiedTransactionEffects = TransactionEffectsEnvelope<AuthorityStrongQuorumSignInfo>;
 
 impl CertifiedTransactionEffects {
     pub fn new(
-        epoch: EpochId,
         effects: TransactionEffects,
-        signatures: Vec<(AuthorityName, AuthoritySignature)>,
-    ) -> Self {
-        Self {
+        signatures: Vec<AuthoritySignInfo>,
+        committee: &Committee,
+    ) -> SuiResult<Self> {
+        Ok(Self {
+            transaction_effects_digest: OnceCell::from(effects.digest()),
             effects,
-            auth_signature: AuthorityQuorumSignInfo { epoch, signatures },
-        }
+            auth_signature: AuthorityStrongQuorumSignInfo::new_from_auth_sign_infos(
+                signatures, committee,
+            )?,
+        })
     }
 
     pub fn to_unsigned_effects(self) -> UnsignedTransactionEffects {
         UnsignedTransactionEffects {
+            transaction_effects_digest: self.transaction_effects_digest,
             effects: self.effects,
             auth_signature: EmptySignInfo {},
         }
@@ -1142,7 +1830,10 @@ pub enum InputObjectKind {
     // A Move object, either immutable, or owned mutable.
     ImmOrOwnedMoveObject(ObjectRef),
     // A Move object that's shared and mutable.
-    SharedMoveObject(ObjectID),
+    SharedMoveObject {
+        id: ObjectID,
+        initial_shared_version: SequenceNumber,
+    },
 }
 
 impl InputObjectKind {
@@ -1150,136 +1841,123 @@ impl InputObjectKind {
         match self {
             Self::MovePackage(id) => *id,
             Self::ImmOrOwnedMoveObject((id, _, _)) => *id,
-            Self::SharedMoveObject(id) => *id,
+            Self::SharedMoveObject { id, .. } => *id,
         }
     }
 
-    pub fn version(&self) -> SequenceNumber {
+    pub fn version(&self) -> Option<SequenceNumber> {
         match self {
-            Self::MovePackage(..) => OBJECT_START_VERSION,
-            Self::ImmOrOwnedMoveObject((_, version, _)) => *version,
-            Self::SharedMoveObject(..) => OBJECT_START_VERSION,
+            Self::MovePackage(..) => Some(OBJECT_START_VERSION),
+            Self::ImmOrOwnedMoveObject((_, version, _)) => Some(*version),
+            Self::SharedMoveObject { .. } => None,
         }
     }
 
     pub fn object_not_found_error(&self) -> SuiError {
         match *self {
             Self::MovePackage(package_id) => SuiError::DependentPackageNotFound { package_id },
-            Self::ImmOrOwnedMoveObject((object_id, _, _)) => SuiError::ObjectNotFound { object_id },
-            Self::SharedMoveObject(object_id) => SuiError::ObjectNotFound { object_id },
+            Self::ImmOrOwnedMoveObject((object_id, version, _)) => SuiError::ObjectNotFound {
+                object_id,
+                version: Some(version),
+            },
+            Self::SharedMoveObject { id, .. } => SuiError::ObjectNotFound {
+                object_id: id,
+                version: None,
+            },
         }
     }
 }
-pub struct SignatureAggregator<'a> {
-    committee: &'a Committee,
-    weight: StakeUnit,
-    used_authorities: HashSet<AuthorityName>,
-    partial: CertifiedTransaction,
+
+pub struct InputObjects {
+    objects: Vec<(InputObjectKind, Object)>,
 }
 
-impl<'a> SignatureAggregator<'a> {
-    /// Start aggregating signatures for the given value into a certificate.
-    pub fn try_new(transaction: Transaction, committee: &'a Committee) -> Result<Self, SuiError> {
-        transaction.verify()?;
-        Ok(Self::new_unsafe(transaction, committee))
+impl InputObjects {
+    pub fn new(objects: Vec<(InputObjectKind, Object)>) -> Self {
+        Self { objects }
     }
 
-    /// Same as try_new but we don't check the transaction.
-    pub fn new_unsafe(transaction: Transaction, committee: &'a Committee) -> Self {
-        Self {
-            committee,
-            weight: 0,
-            used_authorities: HashSet::new(),
-            partial: CertifiedTransaction::new(committee.epoch, transaction),
-        }
+    pub fn len(&self) -> usize {
+        self.objects.len()
     }
 
-    /// Try to append a signature to a (partial) certificate. Returns Some(certificate) if a quorum was reached.
-    /// The resulting final certificate is guaranteed to be valid in the sense of `check` below.
-    /// Returns an error if the signed value cannot be aggregated.
-    pub fn append(
-        &mut self,
-        authority: AuthorityName,
-        signature: AuthoritySignature,
-    ) -> Result<Option<CertifiedTransaction>, SuiError> {
-        signature.verify(&self.partial.data, authority)?;
-        // Check that each authority only appears once.
-        fp_ensure!(
-            !self.used_authorities.contains(&authority),
-            SuiError::CertificateAuthorityReuse
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    pub fn filter_owned_objects(&self) -> Vec<ObjectRef> {
+        let owned_objects: Vec<_> = self
+            .objects
+            .iter()
+            .filter_map(|(object_kind, object)| match object_kind {
+                InputObjectKind::MovePackage(_) => None,
+                InputObjectKind::ImmOrOwnedMoveObject(object_ref) => {
+                    if object.is_immutable() {
+                        None
+                    } else {
+                        Some(*object_ref)
+                    }
+                }
+                InputObjectKind::SharedMoveObject { .. } => None,
+            })
+            .collect();
+
+        debug!(
+            num_mutable_objects = owned_objects.len(),
+            "Checked locks and found mutable objects"
         );
-        self.used_authorities.insert(authority);
-        // Update weight.
-        let voting_rights = self.committee.weight(&authority);
-        fp_ensure!(voting_rights > 0, SuiError::UnknownSigner);
-        self.weight += voting_rights;
-        // Update certificate.
-        self.partial
-            .auth_sign_info
-            .signatures
-            .push((authority, signature));
 
-        if self.weight >= self.committee.quorum_threshold() {
-            Ok(Some(self.partial.clone()))
-        } else {
-            Ok(None)
-        }
+        owned_objects
+    }
+
+    pub fn filter_shared_objects(&self) -> Vec<ObjectRef> {
+        self.objects
+            .iter()
+            .filter(|(kind, _)| matches!(kind, InputObjectKind::SharedMoveObject { .. }))
+            .map(|(_, obj)| obj.compute_object_reference())
+            .collect()
+    }
+
+    pub fn transaction_dependencies(&self) -> BTreeSet<TransactionDigest> {
+        self.objects
+            .iter()
+            .map(|(_, obj)| obj.previous_transaction)
+            .collect()
+    }
+
+    pub fn mutable_inputs(&self) -> Vec<ObjectRef> {
+        self.objects
+            .iter()
+            .filter_map(|(kind, object)| match kind {
+                InputObjectKind::MovePackage(_) => None,
+                InputObjectKind::ImmOrOwnedMoveObject(object_ref) => {
+                    if object.is_immutable() {
+                        None
+                    } else {
+                        Some(*object_ref)
+                    }
+                }
+                InputObjectKind::SharedMoveObject { .. } => Some(object.compute_object_reference()),
+            })
+            .collect()
+    }
+
+    pub fn into_object_map(self) -> BTreeMap<ObjectID, Object> {
+        self.objects
+            .into_iter()
+            .map(|(_, object)| (object.id(), object))
+            .collect()
     }
 }
 
-impl CertifiedTransaction {
-    pub fn new(epoch: EpochId, transaction: Transaction) -> CertifiedTransaction {
-        Self::new_with_signatures(epoch, transaction, vec![])
-    }
-
-    pub fn new_with_signatures(
-        epoch: EpochId,
-        transaction: Transaction,
-        signatures: Vec<(AuthorityName, AuthoritySignature)>,
-    ) -> CertifiedTransaction {
-        CertifiedTransaction {
-            transaction_digest: transaction.transaction_digest,
-            is_verified: false,
-            data: transaction.data,
-            tx_signature: transaction.tx_signature,
-            auth_sign_info: AuthorityQuorumSignInfo { epoch, signatures },
-        }
-    }
-
-    pub fn to_transaction(self) -> Transaction {
-        Transaction::new(self.data, self.tx_signature)
-    }
-
-    /// Verify the certificate.
-    pub fn verify(&self, committee: &Committee) -> Result<(), SuiError> {
-        // We use this flag to see if someone has checked this before
-        // and therefore we can skip the check. Note that the flag has
-        // to be set to true manually, and is not set by calling this
-        // "check" function.
-        if self.is_verified {
-            return Ok(());
-        }
-
-        let mut obligation = VerificationObligation::default();
-        self.add_to_verification_obligation(committee, &mut obligation)?;
-        obligation.verify_all().map(|_| ())
-    }
-
-    fn add_to_verification_obligation(
-        &self,
-        committee: &Committee,
-        obligation: &mut VerificationObligation,
-    ) -> SuiResult<()> {
-        // Add the obligation of the sender signature verification.
-        self.add_sender_sig_to_verification_obligation(obligation)?;
-
-        // Add the obligation of the authority signature verifications.
-        let mut message = Vec::new();
-        self.data.write(&mut message);
-        let idx = obligation.add_message(message);
-
-        self.auth_sign_info
-            .add_to_verification_obligation(committee, obligation, idx)
+impl From<Vec<Object>> for InputObjects {
+    fn from(objects: Vec<Object>) -> Self {
+        Self::new(
+            objects
+                .into_iter()
+                .map(|o| (o.input_object_kind(), o))
+                .collect(),
+        )
     }
 }
 
@@ -1289,25 +1967,13 @@ impl Display for CertifiedTransaction {
         writeln!(writer, "Transaction Hash: {:?}", self.digest())?;
         writeln!(
             writer,
-            "Signed Authorities : {:?}",
-            self.auth_sign_info
-                .signatures
-                .iter()
-                .map(|(name, _)| name)
-                .collect::<Vec<_>>()
+            "Signed Authorities Bitmap : {:?}",
+            self.auth_sig().signers_map
         )?;
-        write!(writer, "{}", &self.data.kind)?;
+        write!(writer, "{}", &self.data().data.kind)?;
         write!(f, "{}", writer)
     }
 }
-
-impl ConfirmationTransaction {
-    pub fn new(certificate: CertifiedTransaction) -> Self {
-        Self { certificate }
-    }
-}
-
-impl BcsSignable for TransactionData {}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ConsensusOutput {
@@ -1322,25 +1988,79 @@ pub struct ConsensusSync {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum ConsensusTransaction {
+pub struct ConsensusTransaction {
+    /// Encodes an u64 unique tracking id to allow us trace a message between Sui and Narwhal.
+    /// Use an byte array instead of u64 to ensure stable serialization.
+    pub tracking_id: [u8; 8],
+    pub kind: ConsensusTransactionKind,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ConsensusTransactionKind {
     UserTransaction(Box<CertifiedTransaction>),
-    Checkpoint(Box<CheckpointFragment>),
+    Checkpoint(Box<SignedCheckpointFragmentMessage>),
+    CheckpointSignature(Box<CheckpointSignatureMessage>),
 }
 
 impl ConsensusTransaction {
+    pub fn new_certificate_message(
+        authority: &AuthorityName,
+        certificate: CertifiedTransaction,
+    ) -> Self {
+        let mut hasher = DefaultHasher::new();
+        let tx_digest = certificate.digest();
+        tx_digest.hash(&mut hasher);
+        authority.hash(&mut hasher);
+        let tracking_id = hasher.finish().to_be_bytes();
+        Self {
+            tracking_id,
+            kind: ConsensusTransactionKind::UserTransaction(Box::new(certificate)),
+        }
+    }
+
+    pub fn new_checkpoint_message(fragment: SignedCheckpointFragmentMessage) -> Self {
+        let mut hasher = DefaultHasher::new();
+        fragment.hash(&mut hasher);
+        let tracking_id = hasher.finish().to_be_bytes();
+        Self {
+            tracking_id,
+            kind: ConsensusTransactionKind::Checkpoint(Box::new(fragment)),
+        }
+    }
+
+    pub fn new_checkpoint_signature_message(data: CheckpointSignatureMessage) -> Self {
+        let mut hasher = DefaultHasher::new();
+        data.summary.auth_signature.signature.hash(&mut hasher);
+        let tracking_id = hasher.finish().to_be_bytes();
+        Self {
+            tracking_id,
+            kind: ConsensusTransactionKind::CheckpointSignature(Box::new(data)),
+        }
+    }
+
+    pub fn get_tracking_id(&self) -> u64 {
+        (&self.tracking_id[..])
+            .read_u64::<BigEndian>()
+            .unwrap_or_default()
+    }
+
     pub fn verify(&self, committee: &Committee) -> SuiResult<()> {
-        match self {
-            Self::UserTransaction(certificate) => certificate.verify(committee),
-            Self::Checkpoint(fragment) => fragment.verify(committee),
+        match &self.kind {
+            ConsensusTransactionKind::UserTransaction(certificate) => {
+                certificate.verify_signature(committee)
+            }
+            ConsensusTransactionKind::Checkpoint(fragment) => fragment.verify(committee.epoch),
+            ConsensusTransactionKind::CheckpointSignature(data) => data.verify(committee),
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, schemars::JsonSchema)]
 pub enum ExecuteTransactionRequestType {
     ImmediateReturn,
     WaitForTxCert,
     WaitForEffectsCert,
+    WaitForLocalExecution,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1349,10 +2069,71 @@ pub struct ExecuteTransactionRequest {
     pub request_type: ExecuteTransactionRequestType,
 }
 
+/// When requested to execute a transaction with WaitForLocalExecution,
+/// TransactionOrchestrator attempts to execute this transaction locally
+/// after it is finalized. This value represents whether the transaction
+/// is confirmed to be executed on this node before the response returns.
+pub type IsTransactionExecutedLocally = bool;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ExecuteTransactionResponse {
     ImmediateReturn,
     TxCert(Box<CertifiedTransaction>),
     // TODO: Change to CertifiedTransactionEffects eventually.
+    EffectsCert(
+        Box<(
+            CertifiedTransaction,
+            CertifiedTransactionEffects,
+            IsTransactionExecutedLocally,
+        )>,
+    ),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, schemars::JsonSchema)]
+pub enum QuorumDriverRequestType {
+    ImmediateReturn,
+    WaitForTxCert,
+    WaitForEffectsCert,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuorumDriverRequest {
+    pub transaction: VerifiedTransaction,
+    pub request_type: QuorumDriverRequestType,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum QuorumDriverResponse {
+    ImmediateReturn,
+    TxCert(Box<CertifiedTransaction>),
     EffectsCert(Box<(CertifiedTransaction, CertifiedTransactionEffects)>),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CommitteeInfoRequest {
+    pub epoch: Option<EpochId>,
+}
+
+#[derive(Serialize, Deserialize, Clone, schemars::JsonSchema, Debug)]
+pub struct CommitteeInfoResponse {
+    pub epoch: EpochId,
+    pub committee_info: Option<Vec<(AuthorityName, StakeUnit)>>,
+    // TODO: We could also return the certified checkpoint that contains this committee.
+    // This would allows a client to verify the authenticity of the committee.
+}
+
+pub type CommitteeInfoResponseDigest = [u8; 32];
+
+impl CommitteeInfoResponse {
+    pub fn digest(&self) -> CommitteeInfoResponseDigest {
+        sha3_hash(self)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CommitteeInfo {
+    pub epoch: EpochId,
+    pub committee_info: Vec<(AuthorityName, StakeUnit)>,
+    // TODO: We could also return the certified checkpoint that contains this committee.
+    // This would allows a client to verify the authenticity of the committee.
 }
